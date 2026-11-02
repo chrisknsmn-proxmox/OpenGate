@@ -18,8 +18,16 @@ impl ChatRequest {
         &self.fields["messages"]
     }
 
-    pub fn into_upstream(self, ollama_model: &str) -> Value {
-        let mut body = self.fields;
+    /// Validated fields other than `model` and `stream`, for providers that
+    /// translate the request (see `chatgpt::responses`).
+    pub fn fields(&self) -> &Map<String, Value> {
+        &self.fields
+    }
+
+    /// The Ollama request body. Borrows, so the request can still be sent to
+    /// the fallback provider if Ollama turns out to be unavailable.
+    pub fn upstream_body(&self, ollama_model: &str) -> Value {
+        let mut body = self.fields.clone();
         body.insert("model".into(), ollama_model.into());
         body.insert("stream".into(), self.stream.into());
         Value::Object(body)
@@ -286,7 +294,7 @@ mod tests {
 
     fn ok(req: Value) -> Value {
         chat_request(req, VM)
-            .map(|r| r.into_upstream("llama3.1:8b"))
+            .map(|r| r.upstream_body("llama3.1:8b"))
             .unwrap()
     }
 

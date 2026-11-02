@@ -2,6 +2,8 @@
 //! refuses connections until it receives the right magic packet over UDP.
 #![allow(dead_code)]
 
+pub mod chatgpt;
+
 use std::{
     net::SocketAddr,
     sync::{

@@ -107,7 +107,8 @@ impl Wol {
     }
 
     /// Returns once Ollama answers, waking its host first if needed.
-    /// Fails with `upstream_unavailable` if it does not come up in time.
+    /// Fails with `upstream_unavailable` (fallback reason `wol_timeout`) if it
+    /// does not come up in time.
     pub async fn ensure_ready(&self) -> Result<(), ApiError> {
         let started = Instant::now();
         let next = match self.in_progress() {
@@ -141,7 +142,7 @@ impl Wol {
                     cooldown_ms = self.0.config.retry_cooldown.as_millis(),
                     "a recent wake attempt failed; not retrying until the cooldown ends"
                 );
-                Err(ApiError::upstream_unavailable())
+                Err(ApiError::wol_timeout())
             }
             Next::Wait(mut outcome) => {
                 // Dropping this future (client gone) just stops waiting.
@@ -156,7 +157,7 @@ impl Wol {
                     );
                     Ok(())
                 } else {
-                    Err(ApiError::upstream_unavailable())
+                    Err(ApiError::wol_timeout())
                 }
             }
         }

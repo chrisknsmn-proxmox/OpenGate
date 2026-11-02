@@ -1,25 +1,37 @@
 # OpenGate
 
-A small, authenticated, OpenAI-compatible gateway in front of **one local Ollama
-model**. OpenGate never calls a cloud provider and holds no cloud credentials.
+A small, authenticated, OpenAI-compatible gateway, **local first**. Every
+request goes to one local Ollama model, waking the Windows PC with
+[Wake-on-LAN](#wake-on-lan) if it is asleep. Only if local inference is
+unavailable can OpenGate fall back to **your ChatGPT plan**, through the
+official [Sign in with ChatGPT](#chatgpt-plan-fallback) flow. OpenGate has no
+OpenAI API-key or API-billing path at all.
 
 ```
-OpenClaw (LXC 103) ──► OpenGate (Coolify VM 104) ──► Ollama on 192.168.1.50 (llama3.1:8b)
-      │
-      └─ on an eligible failure, OpenClaw's own fallback ──► OpenAI model via
-         OpenClaw's supported ChatGPT/Codex sign-in (never passes through OpenGate)
+App / AI agent ──► OpenGate (Coolify VM 104, :8000) ── authenticate client
+                        │
+                        ├─► Ollama on 192.168.1.50 (llama3.1:8b) ── available ──► local answer
+                        │      └─ unreachable ─► Wake-on-LAN ─► wait ─► up ──► local answer
+                        │                                        └─ timeout
+                        │                                              ▼
+                        └─► ChatGPT plan fallback (optional, off by default)
+                               OAuth token from Sign in with ChatGPT
+                               ──► POST https://api.openai.com/v1/responses (store:false, stream:true)
+                               └─ not signed in / limit reached / down ──► clear error, no other billing
 ```
 
-- **OpenGate**: auth, request validation, proxying to Ollama, streaming,
-  timeouts, a concurrency limit, health, logs that never contain prompts, and
-  [Wake-on-LAN](#wake-on-lan) for the Windows PC when it is asleep.
-- **OpenClaw**: agents, tools, ChatGPT/Codex sign-in, primary/fallback choice.
-- **Ollama**: runs the model.
-
-Clients calling OpenGate directly get **no cloud fallback**: if Ollama is down
-they get a clear 503/504. Fallback only happens in OpenClaw, and only for the
-failures OpenClaw's [failover policy](https://docs.openclaw.ai/model-failover)
-recognises. A slow or mediocre-but-successful answer never triggers it.
+- **Local first, always.** Ollama is tried first for every request, and the
+  existing Wake-on-LAN behaviour is unchanged.
+- **Fallback only on unavailability.** OpenGate falls back when Ollama is
+  unreachable, the wake times out, the model is missing, Ollama is
+  overloaded, times out or returns a 5xx. It never falls back because a prompt
+  looks hard, after Ollama refused a request (4xx), or once Ollama has started
+  answering.
+- **No silent billing.** The ChatGPT plan's own limits apply. When they are
+  reached the client gets `subscription_limit_reached`, and nothing is retried
+  elsewhere.
+- With `CHATGPT_FALLBACK_ENABLED=false` (the default), OpenGate behaves exactly
+  as before: if Ollama is down, the client gets a clear 503/504.
 
 ## API
 
@@ -27,10 +39,15 @@ recognises. A slow or mediocre-but-successful answer never triggers it.
 |---|---|---|
 | `GET /health/live` | none | Process is up. No upstream call. Used by the container healthcheck. |
 | `GET /health/ready` | none | Bounded check that Ollama is reachable and the model is installed. `200 {"status":"ready"}` or `503 {"status":"not_ready","reason":…}`. Reveals no addresses or secrets. |
+| `GET /health/providers` | none | Separate status for the gateway, Ollama and the ChatGPT plan (see [Health](#health)). Always 200. Never wakes the PC or spends plan usage. |
 | `GET /v1/models` | Bearer | Lists the one virtual model, `opengate/local`. |
 | `POST /v1/chat/completions` | Bearer | OpenAI-style chat completion, streaming or not. With WOL enabled, may first wait up to `WOL_STARTUP_TIMEOUT_SECONDS` for the PC to wake. |
 
 `/v1/*` requires `Authorization: Bearer <OPENGATE_API_KEY>` (constant-time check).
+Unauthenticated requests never reach Wake-on-LAN or the ChatGPT plan.
+
+Every chat response carries `x-opengate-provider: ollama` or `chatgpt`.
+The `model` field is always the virtual model, whichever provider answered.
 
 ### Supported request fields
 
@@ -70,6 +87,40 @@ include prompt content.
 
 502, 503 and 504 are all failover-eligible in OpenClaw.
 
+With the ChatGPT fallback enabled, a local failure in the 502–504 rows above
+(other than a 4xx from Ollama) triggers the fallback instead of being returned
+directly. If the fallback fails too, the client gets one combined error, with
+both outcomes in `error.providers`:
+
+```json
+{"error":{"code":"all_providers_unavailable","type":"server_error","param":null,
+  "message":"local model unavailable (wol_timeout: …); ChatGPT plan fallback failed (subscription_not_authorized: …)",
+  "providers":{"ollama":"wol_timeout","chatgpt":"subscription_not_authorized"}}}
+```
+
+| Status | `code` | When |
+|---|---|---|
+| 503 | `all_providers_unavailable` | Ollama unavailable and the ChatGPT plan could not serve the request. See `error.providers`. |
+| 429 | `subscription_limit_reached` | Ollama unavailable and the ChatGPT plan (or OpenGate's app limit) is used up. No other billing is tried. |
+
+`error.providers.ollama` is one of:
+
+| Value | Meaning |
+|---|---|
+| `wol_timeout` | The PC did not answer within `WOL_STARTUP_TIMEOUT_SECONDS` after the magic packet, or a wake failed within the cooldown. |
+| `ollama_unavailable` | Unreachable (WOL off), model missing, busy, timed out, or a 5xx/garbled reply. |
+
+`error.providers.chatgpt` (and the `code` of a mid-stream error frame from the ChatGPT plan) is one of:
+
+| Value | Meaning | What to do |
+|---|---|---|
+| `subscription_not_configured` | No credential file: never signed in. | `opengate chatgpt login` |
+| `subscription_not_authorized` | Signed out; plan usage not granted at consent; session revoked or app disconnected in ChatGPT settings; account/workspace not eligible; credentials unreadable (wrong `CHATGPT_CREDENTIALS_KEY`). The message says which. | Sign in again (`--reconsent` if plan usage was declined). |
+| `subscription_expired` | The refresh token expired (30 days unused). | `opengate chatgpt login` |
+| `subscription_limit_reached` | ChatGPT plan or app usage limit. Fallback pauses for `CHATGPT_LIMIT_PAUSE_SECONDS`. | Wait, or review limits at [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage). |
+| `subscription_provider_unavailable` | OpenAI or the network is unavailable. Credentials are kept. | Retry later. |
+| `unsupported_request` | The request uses something the ChatGPT plan route cannot do, e.g. `temperature` or `max_tokens` (named in `param`). | See [Supported requests](#supported-requests-on-the-chatgpt-plan). |
+
 ### Streaming
 
 Frames are relayed one at a time as they arrive (`data: {...}\n\n`), with
@@ -78,6 +129,13 @@ sent it. If the stream fails after it has started (upstream error, idle timeout,
 overall timeout, or EOF without `[DONE]`), OpenGate sends one error frame,
 `data: {"error":{…}}`, and ends the stream **without** `[DONE]`. If the client
 disconnects, the upstream request is dropped and Ollama stops generating.
+
+The same rules apply to a ChatGPT plan stream. OpenAI's events are translated
+to `chat.completion.chunk` frames, and `[DONE]` follows only
+`response.completed` (or `response.incomplete`, sent with `finish_reason:
+"length"`). A usage limit or error mid-stream ends the stream with one error
+frame and no `[DONE]`. Once any output has been sent, OpenGate never retries
+on another provider.
 
 ## Configuration
 
@@ -104,6 +162,17 @@ disconnects, the upstream request is dropped and Ollama stops generating.
 | `WOL_RETRY_COOLDOWN_SECONDS` | `30` | After a failed wake, requests get an immediate 503 for this long; the next request after it makes a fresh attempt. |
 | `WOL_RELAY_ADDRESS` | — | `host:port` of the [host-side relay](#wake-on-lan-from-docker), e.g. `host.docker.internal:9009`. When set, it is used instead of `WOL_BROADCAST_ADDRESS`. Needed in Docker. |
 | `WOL_RELAY_LISTEN` | — | Relay only (`opengate wol-relay`): `IP:port` to listen on, e.g. `172.17.0.1:9009`. |
+| `CHATGPT_FALLBACK_ENABLED` | `false` | `true` turns on the [ChatGPT plan fallback](#chatgpt-plan-fallback). |
+| `CHATGPT_CREDENTIALS_KEY` | required if enabled | 32 random bytes, base64 (`openssl rand -base64 32`). Encrypts the stored OAuth tokens. Keep it as a Coolify secret. |
+| `CHATGPT_CREDENTIALS_PATH` | `/data/chatgpt/credentials.json` | Encrypted credential file. Must be on a persistent volume. |
+| `CHATGPT_AUTH_METHOD` | `official_oauth` | The only accepted value. |
+| `CHATGPT_PROVIDER` | `responses` | The only accepted value. `codex_app_server` is refused at startup ([why](#why-not-codex-app-server)). |
+| `CHATGPT_MODEL` | `auto` | `auto` uses the first model your account lists (re-read hourly), or set a slug from that list. |
+| `CHATGPT_REQUEST_TIMEOUT_SECONDS` | `300` | Overall cap per fallback request, including the stream. |
+| `CHATGPT_STREAM_IDLE_TIMEOUT_SECONDS` | `120` | Max gap between ChatGPT stream events. |
+| `CHATGPT_LIMIT_PAUSE_SECONDS` | `300` | After a usage-limit error, fallback requests fail fast for this long without calling OpenAI. |
+| `CHATGPT_DROP_UNSUPPORTED_SAMPLING` | `false` | `true` drops `temperature`, `top_p`, `seed` and the penalties on fallback instead of rejecting the request. |
+| `OPENAI_API_BILLING_ENABLED` | `false` | Must be `false`. `true` makes OpenGate refuse to start. `OPENAI_API_KEY` is never read; if it is set, OpenGate logs a warning. |
 
 The process refuses to start if a required value is missing or invalid. Error
 messages name the variable, never its value. Blank values count as unset.
@@ -114,6 +183,12 @@ that is set must be valid, or OpenGate refuses to start. If the MAC, or both
 the broadcast and relay addresses, are missing, OpenGate starts with WOL
 **disabled** and logs a warning. The MAC and network settings live only in the
 environment, never in the source.
+
+ChatGPT values are only read when `CHATGPT_FALLBACK_ENABLED=true`, and the
+`opengate chatgpt …` commands always read them. Then they must be valid, or
+OpenGate refuses to start. A missing or revoked *sign-in* never stops the
+gateway, though: local inference keeps working, and fallback requests fail
+closed with `subscription_not_configured` or `subscription_not_authorized`.
 
 ## Wake-on-LAN
 
@@ -228,6 +303,324 @@ user-defined bridge sent its packet to `host.docker.internal:9009`. The relay
 then put a 102-byte magic packet on `eth0` as an Ethernet broadcast
 (`ff:ff:ff:ff:ff:ff`, to `192.168.1.255`). The test used a dummy MAC and port.
 
+## ChatGPT plan fallback
+
+Off by default. When enabled, a request that local Ollama cannot serve
+(after Wake-on-LAN, if enabled) is sent to **your ChatGPT plan**, using
+OpenAI's documented *Sign in with ChatGPT → ChatGPT plan usage* flow for
+open-source clients:
+
+- [Overview](https://developers.openai.com/siwc/token-sharing-open-source)
+- [Registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
+- [Accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions)
+- [Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
+- [Self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
+- [Errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)
+- [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+
+How it works:
+
+1. You sign in once, interactively. OpenGate registers itself with
+   `client_id=dynamic_agent_client`, `agent_name_hint=OpenGate` and a stable
+   per-host `ext_agent_host_id`. It uses PKCE and a `127.0.0.1` loopback
+   callback, and you approve the requested scopes in your browser. OpenAI
+   returns an issued `client_id` (`oaiapp_…`), which is saved and reused.
+2. OpenGate validates the ID token against OpenAI's JWKS (issuer, audience,
+   expiry, nonce). It enables plan usage **only if** the granted scopes include
+   `chatgpt.tokens.use.direct`: signing in alone does not grant inference.
+3. On fallback, OpenGate sends the OAuth access token as a bearer token to
+   `POST https://api.openai.com/v1/responses` with `store: false` and
+   `stream: true`, and translates the result back into a Chat Completion.
+   Usage counts against your ChatGPT plan. No client secret, no partner key and
+   no API key exist anywhere in this flow.
+4. Tokens are refreshed automatically before they expire, and are revoked when
+   you sign out.
+
+### Requirements and eligibility
+
+What the official docs say, as of 2026-11-02:
+
+- **Who can use it:** "Eligible ChatGPT **Plus and Pro** users". A workspace or
+  policy can still make an account ineligible (`subscription_not_authorized`,
+  upstream code `subscription_sharing_user_not_eligible`).
+- **Which apps:** "ChatGPT plan usage is available to all open-source partners
+  and selected private clients." The open-source flow uses **self-service
+  dynamic registration**: there is no client ID to apply for. The "Request a
+  client ID" waitlist is for the commercial website and plugin sign-in, which
+  OpenGate does not use. The docs scope this flow to "open-source and locally
+  hosted apps". A *paid or remotely hosted* app needs OpenAI's
+  [interest form](https://openai.com/form/sign-in-with-chatgpt-interest/)
+  instead.
+- **How OpenGate fits:** it is a self-hosted tool you run for yourself, on your
+  own VM. The docs' *Self-hosted VMs* page covers exactly that case. Two things
+  are your call, and the docs do not settle them:
+  - **The repository is currently private and unlicensed.** If you want
+    OpenGate clearly inside the "open-source" framing, publish it under an
+    open-source license.
+  - **OpenGate re-exposes your plan to anything holding `OPENGATE_API_KEY`.**
+    Keep that key to your own apps and agents. Giving it to other people would
+    mean sharing your ChatGPT plan.
+- **Preview:** OpenAI labels this flow a preview, with its own limitations (see
+  [Supported requests](#supported-requests-on-the-chatgpt-plan)). Behaviour may
+  change.
+- OpenAI's help-center article
+  [Using your ChatGPT plan in other apps and sites](https://help.openai.com/en/articles/20001542-using-your-chatgpt-plan-in-other-apps-and-sites)
+  blocks automated fetching (HTTP 403), so it was not reviewed for this
+  implementation. Read it before enabling the fallback.
+
+**Status:** the code follows the documented flow and passes all tests against
+mocks of OpenAI's services. It has **not yet been verified against a real
+ChatGPT account.** It counts as working only once
+[`opengate chatgpt test`](#end-to-end-fallback-test) succeeds for your account.
+
+### Why not Codex app-server
+
+The docs also describe driving `codex app-server` with the same OAuth token.
+OpenGate calls the Responses API directly instead, because that is the
+documented core of this flow and it fits a chat gateway better:
+
+- Codex app-server is marked `[experimental]` in the CLI. It is a coding-agent
+  harness: it wraps every turn in its own agent instructions, and it can run
+  shell and MCP tools and child agents, all of which would have to be disabled
+  and kept disabled.
+- It must be **restarted on every hourly token renewal**, then `thread/resume`d.
+- It would add the Codex runtime to the image.
+
+The direct route has none of these: no agent and no tools, nothing to sandbox,
+in-process token refresh with no restarts, and a small image.
+`CHATGPT_PROVIDER=codex_app_server` is refused at startup rather than ignored.
+
+### Supported requests on the ChatGPT plan
+
+OpenGate's normal validation applies first: tools, images, `response_format`
+and similar are already rejected for every provider. On fallback:
+
+| Request feature | On the ChatGPT plan |
+|---|---|
+| `messages` (system, developer, user, assistant; text) | Supported. System prompts are sent as `developer` messages, since this route rejects system items. The full history is sent on every request (`store: false`, no `previous_response_id`). |
+| `stream: true` / `false` | Supported. OpenAI always streams; for `stream: false`, OpenGate collects the stream and returns one `chat.completion`. Partial text is never returned as a success. |
+| `stream_options.include_usage` | Supported (`input_tokens`/`output_tokens` mapped to `prompt_tokens`/`completion_tokens`). |
+| `n: 1`, `user`, `tools: []`, `tool_choice: "none"`, `parallel_tool_calls` | Accepted no-ops, as for Ollama. |
+| `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `seed` | **Rejected** with `unsupported_request` (this route does not accept them), unless `CHATGPT_DROP_UNSUPPORTED_SAMPLING=true`, which drops them. |
+| `max_tokens` / `max_completion_tokens`, `stop` | **Always rejected** on fallback. The route has no `max_output_tokens` and no stop sequences, and dropping them would silently change the output. |
+| Response `id` | OpenAI's response ID (`resp_…`), preserved. |
+| `model` in responses | Always the virtual model (`opengate/local`). The `x-opengate-provider` header says who answered. |
+| `finish_reason` | `stop` (`response.completed`), `length`/`content_filter` (`response.incomplete`). Failures are errors, never a finish reason. |
+| Refusals | Returned in `message.refusal` / `delta.refusal`. |
+
+These parameters are rejected only on fallback: with Ollama up, they work as
+before.
+
+### Sign in (first time, headless Coolify, from your Mac)
+
+Sign-in runs only as a command inside the OpenGate container. OpenGate's HTTP
+port has **no** sign-in endpoints, so only someone with shell access to the
+container (Coolify login or SSH to VM 104) can connect or disconnect an
+account.
+
+1. Deploy with `CHATGPT_FALLBACK_ENABLED=true` and `CHATGPT_CREDENTIALS_KEY` set
+   (see [Deploy on Coolify](#deploy-on-coolify-vm-104)).
+2. Open a shell in the container. In Coolify use the resource's **Terminal**
+   tab, or from VM 104:
+   `docker exec -it <opengate-container> sh`.
+3. Choose how the browser's callback gets back to the container.
+
+   **A. Paste the URL (no tunnel).** In the container:
+
+   ```sh
+   opengate chatgpt login
+   ```
+
+   Open the printed URL in your Mac's browser, sign in, and approve
+   **using your ChatGPT plan**. The browser is then sent to
+   `http://127.0.0.1:1455/auth/callback?code=…`, which will not load on the
+   Mac. That is expected. Copy the **whole URL** from the address bar, paste it
+   into the container terminal and press Enter. The code is single-use, bound
+   to this attempt's PKCE verifier, and expires quickly, so paste it right away.
+
+   **B. SSH tunnel (callback completes by itself).** On VM 104, find the
+   container's IP:
+
+   ```sh
+   docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' <opengate-container>
+   ```
+
+   On the Mac, forward the callback port to it, and leave this running:
+
+   ```sh
+   ssh -N -L 1455:<container-ip>:1455 <user>@<vm-104>
+   ```
+
+   In the container:
+
+   ```sh
+   opengate chatgpt login --listen 0.0.0.0:1455
+   ```
+
+   Open the URL on the Mac. After you approve, the browser reaches the
+   container through the tunnel and the terminal finishes by itself. Nothing
+   else should be listening on port 1455 on the Mac (a running Codex CLI login
+   would be).
+
+4. The command checks the granted scopes. If you declined plan usage, it says
+   so and the fallback stays off. Run `opengate chatgpt login --reconsent` to
+   grant it.
+5. Run `opengate chatgpt test`. This is the proof that it works (see below).
+   The gateway picks up the new credentials **without a restart**.
+
+Other commands: `opengate chatgpt status` (account, scopes, expiry; never
+tokens), `opengate chatgpt logout`, `opengate chatgpt init` (creates the file
+and host ID without signing in), and `login --new-account` (replaces the saved
+account with a different one).
+
+Signing in runs *inside* the container, with the container's own host ID, so
+no credential file is ever copied between machines. That avoids the docs'
+caveat about transferred sessions. Never copy a Codex CLI `auth.json` or
+browser cookies into OpenGate: they will not work and are not authorized.
+
+### Usage limits
+
+- Requests count against your ChatGPT plan. For **Plus**, the five-hour usage
+  limit is *shared* across every app that uses your plan; **Pro** has no
+  five-hour limit. In
+  [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage) you can set
+  OpenGate's own weekly limit (10–100%) and whether it may use **ChatGPT
+  credits** after the plan limit is reached. That setting lives at OpenAI, and
+  OpenGate can neither see nor change it. For a hard stop, leave credits off
+  for OpenGate. (These are ChatGPT credits, not API billing.)
+- When a limit is reached (HTTP 429 or mid-stream
+  `subscription_sharing_usage_limit_exceeded`), OpenGate returns 429
+  `subscription_limit_reached`. It pauses all fallback requests for
+  `CHATGPT_LIMIT_PAUSE_SECONDS` without contacting OpenAI, and never retries
+  on anything else. It does not guess a reset time, because OpenAI's code does
+  not say whether the plan limit or the app limit was hit.
+- Local inference is unaffected. As soon as Ollama is up, requests are served
+  locally again.
+
+### Credential storage and security
+
+- **Storage:** `/data/chatgpt/credentials.json` on the named volume
+  `opengate-data`. The file is sealed with XChaCha20-Poly1305 under
+  `CHATGPT_CREDENTIALS_KEY`, written atomically, mode `0600` in a `0700`
+  directory, owned by uid 10001. The container keeps its read-only root
+  filesystem, no capabilities and `no-new-privileges`. It holds the issued
+  client ID, the verified account (`sub`, email), the granted scopes, the
+  access/refresh/ID tokens, and this host's ID.
+- **Nothing in the image or Git:** the image contains no credentials, and the
+  key is a Coolify secret. A copy of the volume alone is useless. A wrong key
+  is reported as `subscription_not_authorized` ("cannot be read"), and the file
+  is left untouched.
+- **Never exposed:** tokens are not logged (a test proves this at TRACE),
+  never returned to API callers, never put in URLs. The ID token is not sent
+  as `id_token_hint`, because the authorization URL is printed to a terminal.
+  HTTP redirects are refused, and proxies are ignored.
+- **Restarts and redeploys** keep the volume, so they keep the sign-in.
+  Changing `CHATGPT_CREDENTIALS_KEY` means signing in again: run
+  `opengate chatgpt logout` first, delete the file, then sign in with the new
+  key.
+- **If credentials are compromised:** disconnect OpenGate in ChatGPT
+  Settings, run `opengate chatgpt logout`, rotate `CHATGPT_CREDENTIALS_KEY`,
+  and sign in again.
+
+**Token lifecycle:**
+
+- Access tokens last one hour and are refreshed five minutes before expiry.
+  Refreshes are serialized, so one burst means one refresh, and the rotated
+  refresh token is saved at once.
+- A 401 triggers one refresh and one retry, safe because nothing has been
+  streamed yet.
+- Refresh tokens last 30 days and renew with every refresh.
+- A temporary outage of OpenAI's auth service keeps the still-valid token and
+  retries after 30 s.
+- An expired refresh token becomes `subscription_expired`. A revoked or reused
+  one, or a disconnect in ChatGPT settings (OpenAI does not notify apps of
+  this), becomes `subscription_not_authorized`. In both cases the tokens are
+  cleared and the client ID kept, so `opengate chatgpt login` reconnects the
+  same registration. All of this happens without restarting the gateway.
+
+**Sign out:** `opengate chatgpt logout` revokes the refresh token at OpenAI's
+`revocation_endpoint`, with retries. It then deletes the access, refresh and
+ID tokens, and keeps the client ID and host ID for a later sign-in. If
+revocation cannot be confirmed, it says so: then disconnect OpenGate in
+ChatGPT Settings yourself.
+
+### Health
+
+`GET /health/providers` (no auth) reports each provider separately:
+
+```json
+{"gateway":{"status":"ok"},
+ "ollama":{"status":"ready","wake_on_lan":true},
+ "chatgpt":{"status":"authorized","fallback_enabled":true}}
+```
+
+- **`ollama`** is `ready`, `upstream_unreachable`, `upstream_timeout`,
+  `model_not_installed` or `upstream_error`. The probe never wakes the PC.
+- **`chatgpt`** is `disabled`, `authorized`, `subscription_not_configured`,
+  `subscription_not_authorized`, `subscription_expired`,
+  `subscription_limit_reached` (while paused) or
+  `subscription_provider_unavailable` (failed within the last minute). It is
+  computed from the stored session: it never calls OpenAI, so it never spends
+  plan usage. That also means `authorized` is a statement about the stored
+  session, not proof that inference works. Only `opengate chatgpt test` proves
+  that.
+
+The container healthcheck still uses `/health/live`, so a missing sign-in or
+a sleeping PC never makes Coolify restart the gateway.
+
+### End-to-end fallback test
+
+1. **Real inference through your plan.** In the container:
+
+   ```sh
+   opengate chatgpt test
+   ```
+
+   Expect `OK: response resp_… finished with "stop"` and the reply. This uses a
+   little plan usage. If it fails, it prints the state code (table above).
+   Then check [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage):
+   OpenGate should appear there.
+2. **Local first.** With the PC awake, send a [smoke test](#smoke-tests)
+   request with `-i`. Expect `x-opengate-provider: ollama`, and no `ChatGPT`
+   lines in the logs.
+3. **Wake still preferred.** Put the PC to sleep and send a request. The logs
+   should show `sent Wake-on-LAN magic packet`, and if the PC boots within
+   `WOL_STARTUP_TIMEOUT_SECONDS`, the reply has `x-opengate-provider: ollama`.
+4. **Fallback.** Keep the PC from waking (unplug its network, or temporarily
+   set `WOL_STARTUP_TIMEOUT_SECONDS=10`). Send a request. Expect the wake
+   attempt, then `local inference unavailable; trying the ChatGPT plan
+   fallback`, `serving request from the ChatGPT plan`, and
+   `x-opengate-provider: chatgpt`. Try `"stream": true` too.
+5. **Back to local.** Wake the PC. The next request is `ollama` again.
+6. **Revocation.** Disconnect OpenGate in ChatGPT Settings and repeat step 4.
+   Expect 503 `all_providers_unavailable` with
+   `providers.chatgpt = subscription_not_authorized`. Sign in again to restore
+   it.
+
+```bash
+docker logs -f <opengate-container> 2>&1 | grep -E 'wol|Wake|ChatGPT|chat/completions'
+```
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Startup error naming `CHATGPT_CREDENTIALS_KEY` | Missing or not 32 bytes of base64. Generate with `openssl rand -base64 32`. |
+| `subscription_not_configured` | Never signed in on this volume. Run `opengate chatgpt login`. |
+| `subscription_not_authorized … cannot be read` | The key changed, or the file was modified. Restore the old key, or log out, delete the file and sign in again. |
+| `subscription_not_authorized … not granted` | Plan usage was declined at consent. Run `opengate chatgpt login --reconsent`. |
+| `subscription_not_authorized … revoked or disconnected` | Disconnected in ChatGPT settings, or the session was revoked. Sign in again. |
+| `subscription_not_authorized (subscription_sharing_user_not_eligible …)` | The account, plan or workspace is not eligible (Plus/Pro only; workspace policy). Signing in again will not help. |
+| `subscription_expired` | Unused for 30 days. Sign in again. |
+| `subscription_limit_reached` | Plan or app limit. See [Usage limits](#usage-limits). |
+| `unsupported_request`, `param: temperature` | The client sends sampling parameters. Remove them, or set `CHATGPT_DROP_UNSUPPORTED_SAMPLING=true`. |
+| `subscription_provider_unavailable` | OpenAI or the network is down. From VM 104, check `docker exec <c> opengate chatgpt status` and outbound HTTPS to `auth.openai.com` / `api.openai.com`. |
+| `opengate chatgpt login`: `cannot listen on …` | Port 1455 is in use in the container (a previous login is still running). Use `--port 1456` (the redirect may use any port), or stop the other one. |
+| Browser shows "can't connect to 127.0.0.1:1455" | Expected without a tunnel. Paste the full URL into the terminal (method A). |
+| `callback state does not match` | The pasted URL is from an older attempt. Start `login` again and use the newest URL. |
+| `CHATGPT_MODEL=auto` picks a model you don't want | Set `CHATGPT_MODEL` to a slug from your account's list. A wrong slug fails with `unsupported_request` or `subscription_provider_unavailable`. |
+
+
 ## Development (Ubuntu VM)
 
 The VM has Docker but no Rust toolchain. Either install Rust for your user:
@@ -269,10 +662,42 @@ the exact magic packet. Those tests cover:
 - the relay ignoring foreign payloads and repeats
 - a wake through the relay by hostname
 
+`tests/fallback.rs` puts a real OpenGate in front of the mock PC and a mock of
+OpenAI's sign-in and Responses services. It records every bearer token the
+mock receives. It covers:
+- Ollama online: no fallback, and OpenAI is never contacted
+- Ollama offline: WOL is attempted, and a successful wake uses Ollama
+- WOL timeout: fallback, with the request contract checked (`store:false`,
+  `stream:true`, `developer` role, no extra fields)
+- streaming translation, including usage
+- missing, signed-out and scope-less credentials
+- revoked sessions: tokens cleared, and the error sticks
+- expired sessions
+- a 401 → one refresh → success
+- a temporary refresh outage keeping the still-valid token
+- usage limit over HTTP and mid-stream: 429, a pause, no retry, no other
+  credential ever sent
+- `OPENAI_API_KEY` in the environment never used
+- unsupported parameters
+- invalid client keys triggering neither WOL nor OpenAI
+- six concurrent fallbacks sharing one wake and one refresh
+- client cancellation stopping the ChatGPT stream
+- persisted credentials surviving a restart, and the wrong key failing safely
+- the cloud being down while local keeps working
+- Ollama 4xx and mid-stream failures never falling back
+- credentials written by `login` picked up without a restart
+
+`tests/chatgpt_login.rs` runs the sign-in flow against the mock authorization
+server: dynamic registration, PKCE, ID-token signature, issuer, audience and
+nonce, declined consent, a declined plan scope, and revocation.
+`tests/logging.rs` also proves that no token, prompt or reply is ever logged
+on the ChatGPT path.
+
 Before committing:
 
 ```bash
-cargo fmt --check && cargo clippy -- -D warnings && cargo test && cargo build --release
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && cargo build --release
+docker build -t opengate:local .
 ```
 
 ### Test Wake-on-LAN locally
@@ -364,6 +789,19 @@ curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
    WOL_BROADCAST_ADDRESS=192.168.1.255
    WOL_RELAY_ADDRESS=host.docker.internal:9009
    ```
+   For the ChatGPT plan fallback, also set (`CHATGPT_CREDENTIALS_KEY` as a
+   **secret**, generated once with `openssl rand -base64 32` and kept in your
+   password manager):
+
+   ```
+   CHATGPT_FALLBACK_ENABLED=true
+   CHATGPT_CREDENTIALS_KEY=<secret>
+   CHATGPT_MODEL=auto
+   ```
+   `compose.yaml` mounts the named volume `opengate-data` at `/data`, where the
+   encrypted credentials live. Coolify keeps named volumes across restarts and
+   redeploys. Check that it appears under the resource's **Storages**, and never
+   delete it, or you will have to sign in again.
 3. Under **Domains**, add a domain for service `opengate` with the internal
    port suffix, e.g. `https://opengate.<your-domain>:8000`. Keep it reachable
    only from trusted networks (LAN/VPN or proxy allowlist); it is the single
@@ -393,6 +831,11 @@ curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
    - The OpenGate startup log shows `wol: Some(WolConfig { … target: Relay("host.docker.internal:9009") … })`.
      If it shows `wol: None`, a value is missing; look for the WOL warning.
    - The relay log shows `Wake-on-LAN relay listening`.
+   - With the fallback enabled: the startup log shows `chatgpt: Some(ChatGptConfig { … credentials_key: <redacted> … })`
+     and `/health/providers` shows `"chatgpt":{"status":"subscription_not_configured"…}`
+     until you [sign in](#sign-in-first-time-headless-coolify-from-your-mac), then `authorized`.
+6. **Sign in** once, then run `opengate chatgpt test`. See
+   [End-to-end fallback test](#end-to-end-fallback-test).
 
 ### Test Wake-on-LAN from inside the production container
 
@@ -439,10 +882,12 @@ resource; the images run `opengate` and `opengate wol-relay`).
 
    A second request right after should log no packet.
 
-## OpenClaw integration
+## Using OpenGate from OpenClaw (optional)
 
-Verify each step against the **installed** OpenClaw release; these are not
-drop-in values.
+OpenClaw is **not required**: OpenGate now does the ChatGPT plan fallback
+itself, so any OpenAI-compatible client gets it. If you use OpenClaw as a
+client, verify each step against the **installed** OpenClaw release; these are
+not drop-in values.
 
 1. **Add OpenGate as a custom provider** ([custom providers](https://docs.openclaw.ai/gateway/config-tools/custom-providers)).
    This is a sketch to check against the installed schema (`apiKey` SecretRef
@@ -475,7 +920,7 @@ drop-in values.
        defaults: {
          model: {
            primary: "opengate/opengate/local",   // confirm with `openclaw models list`
-           fallbacks: ["openai/<verified-subscription-model>"],
+           // No `fallbacks` needed: OpenGate falls back to your ChatGPT plan itself.
          },
        },
      },
@@ -490,21 +935,16 @@ drop-in values.
    large. On the Windows host, set `OLLAMA_CONTEXT_LENGTH` (e.g. `32768`, as
    VRAM allows), restart Ollama, and set the same value as `contextWindow`.
 
-3. **Subscription fallback.** Sign in with OpenClaw's supported flow (headless LXC):
-   `openclaw models auth login --provider openai --method device-code`
-   ([auth docs](https://docs.openclaw.ai/providers/openai/authentication)).
-   Then pick a model your account actually exposes (`openclaw models list`) and
-   put that exact ref in `fallbacks`. Never copy tokens out of OpenClaw, and
-   never give OpenGate a ChatGPT credential.
-
-4. **Prove it.** With Ollama up, confirm a turn is served locally (OpenGate
-   logs a 200). Then stop Ollama: OpenGate returns 503 `upstream_unavailable`,
-   and OpenClaw should log a fallback to the OpenAI model. Restore Ollama and
-   confirm the next turn is local again. A 503 alone does not prove fallback
-   works; check OpenClaw's logs. Note that 400s (bad request, tools) do **not**
-   trigger OpenClaw fallback.
+3. **Fallback.** Leave OpenClaw's own fallback out, or two layers will each
+   try to recover from the same failure. OpenGate's fallback rejects
+   `temperature`, `top_p` and `max_tokens` by default. If OpenClaw always sends
+   them, either configure the model without them, or set
+   `CHATGPT_DROP_UNSUPPORTED_SAMPLING=true` (this drops the sampling hints
+   only; `max_tokens` is still rejected).
 
 ## Out of scope
 
-No tev1 or other routing model, no complexity scoring, no cloud SDKs or
-credentials, no database, no dashboard, one model only.
+No tev1 or other routing model, no complexity scoring or prompt-based
+escalation. No OpenAI API keys, Platform credits or API billing. No Codex
+app-server, browser cookies, scraped ChatGPT endpoints or copied Codex `auth.json`.
+No database, no dashboard, one local model only.

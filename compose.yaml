@@ -28,6 +28,25 @@ services:
       WOL_STARTUP_TIMEOUT_SECONDS: ${WOL_STARTUP_TIMEOUT_SECONDS:-90}
       WOL_POLL_INTERVAL_SECONDS: ${WOL_POLL_INTERVAL_SECONDS:-3}
       WOL_RETRY_COOLDOWN_SECONDS: ${WOL_RETRY_COOLDOWN_SECONDS:-30}
+      # ChatGPT plan fallback (README: "ChatGPT plan fallback"). Off unless
+      # CHATGPT_FALLBACK_ENABLED=true; then CHATGPT_CREDENTIALS_KEY is required.
+      # Sign in once with `opengate chatgpt login` inside this container.
+      CHATGPT_FALLBACK_ENABLED: ${CHATGPT_FALLBACK_ENABLED:-false}
+      CHATGPT_AUTH_METHOD: ${CHATGPT_AUTH_METHOD:-official_oauth}
+      CHATGPT_PROVIDER: ${CHATGPT_PROVIDER:-responses}
+      CHATGPT_MODEL: ${CHATGPT_MODEL:-auto}
+      CHATGPT_CREDENTIALS_KEY: ${CHATGPT_CREDENTIALS_KEY:-}
+      CHATGPT_CREDENTIALS_PATH: /data/chatgpt/credentials.json
+      CHATGPT_REQUEST_TIMEOUT_SECONDS: ${CHATGPT_REQUEST_TIMEOUT_SECONDS:-300}
+      CHATGPT_STREAM_IDLE_TIMEOUT_SECONDS: ${CHATGPT_STREAM_IDLE_TIMEOUT_SECONDS:-120}
+      CHATGPT_LIMIT_PAUSE_SECONDS: ${CHATGPT_LIMIT_PAUSE_SECONDS:-300}
+      CHATGPT_DROP_UNSUPPORTED_SAMPLING: ${CHATGPT_DROP_UNSUPPORTED_SAMPLING:-false}
+      # Must stay false: OpenGate refuses to start otherwise. It never uses
+      # an OpenAI API key or API billing.
+      OPENAI_API_BILLING_ENABLED: "false"
+    volumes:
+      # Encrypted credentials + host ID; survives restarts and redeploys.
+      - opengate-data:/data
     # Lets WOL_RELAY_ADDRESS=host.docker.internal:9009 reach the host-side relay.
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -45,3 +64,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  opengate-data:

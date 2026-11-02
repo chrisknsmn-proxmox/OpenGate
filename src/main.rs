@@ -26,6 +26,10 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("wol-relay") {
         return wol_relay().await;
     }
+    if std::env::args().nth(1).as_deref() == Some("chatgpt") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return opengate::chatgpt::cli::run(&args).await;
+    }
 
     let config = match Config::from_env() {
         Ok(config) => config,
@@ -38,6 +42,9 @@ async fn main() -> ExitCode {
         warn!("LOG_PROMPT_CONTENT=true: prompt messages will be written to the log");
     }
     info!(?config, "starting");
+    if config.chatgpt.is_some() {
+        info!("ChatGPT plan fallback enabled: used only when local inference is unavailable");
+    }
 
     let addr = config.listen_addr();
     let listener = match tokio::net::TcpListener::bind(addr).await {

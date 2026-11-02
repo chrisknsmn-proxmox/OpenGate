@@ -1,7 +1,9 @@
 //! OpenAI-style error responses. Messages never contain prompt content or secrets.
 //!
-//! Status codes are chosen so OpenClaw's model failover can tell local-side
-//! failures (503/504/502, failover-eligible) from caller mistakes (400, terminal).
+//! Status codes let clients tell server-side failures (503/504/502, worth
+//! retrying later) from caller mistakes (400, terminal). Errors raised by the
+//! local provider also record whether OpenGate's own ChatGPT plan fallback may
+//! take over (`fallback_reason`); see `fallback.rs`.
 
 use std::borrow::Cow;
 
@@ -14,12 +16,20 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use crate::chatgpt::CloudError;
+
 #[derive(Debug)]
 pub(crate) struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     message: Cow<'static, str>,
     pub param: Option<String>,
+    /// Set on local-provider failures that happened before any output was
+    /// produced, naming why local inference is unavailable. Only these may
+    /// fall back to the ChatGPT plan; everything else is returned as is.
+    pub fallback_reason: Option<&'static str>,
+    /// Per-provider outcome, included in the body when a fallback was tried.
+    providers: Option<Value>,
 }
 
 impl ApiError {
@@ -29,7 +39,14 @@ impl ApiError {
             code,
             message: message.into(),
             param: None,
+            fallback_reason: None,
+            providers: None,
         }
+    }
+
+    fn local(mut self, reason: &'static str) -> Self {
+        self.fallback_reason = Some(reason);
+        self
     }
 
     pub fn with_param(mut self, param: impl Into<String>) -> Self {
@@ -79,6 +96,13 @@ impl ApiError {
             "upstream_unavailable",
             "local model server is unreachable",
         )
+        .local("ollama_unavailable")
+    }
+
+    /// Same response as [`Self::upstream_unavailable`], so existing clients
+    /// see no change, but the fallback reports that waking the PC failed.
+    pub fn wol_timeout() -> Self {
+        Self::upstream_unavailable().local("wol_timeout")
     }
 
     pub fn upstream_model_unavailable() -> Self {
@@ -87,6 +111,7 @@ impl ApiError {
             "upstream_model_unavailable",
             "local model is not available on the model server",
         )
+        .local("ollama_unavailable")
     }
 
     pub fn upstream_overloaded() -> Self {
@@ -95,6 +120,7 @@ impl ApiError {
             "upstream_overloaded",
             "local model server is busy",
         )
+        .local("ollama_unavailable")
     }
 
     pub fn upstream_timeout() -> Self {
@@ -103,9 +129,17 @@ impl ApiError {
             "upstream_timeout",
             "local model server timed out",
         )
+        .local("ollama_unavailable")
     }
 
+    /// The local server failed (5xx or transport error).
     pub fn upstream_error(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, "upstream_error", message).local("ollama_unavailable")
+    }
+
+    /// The local server refused this particular request (4xx). The model is
+    /// up, so this is not a reason to fall back.
+    pub fn upstream_rejected(message: impl Into<Cow<'static, str>>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "upstream_error", message)
     }
 
@@ -115,6 +149,7 @@ impl ApiError {
             "upstream_invalid_response",
             "local model server returned an unexpected response",
         )
+        .local("ollama_unavailable")
     }
 
     pub fn stream_incomplete() -> Self {
@@ -125,15 +160,55 @@ impl ApiError {
         )
     }
 
+    /// A ChatGPT plan failure, for use mid-stream or when the local model was
+    /// not involved. Codes are listed in README "Errors".
+    pub fn cloud(e: &CloudError) -> Self {
+        let mut err = Self::new(e.status(), e.code(), e.message());
+        err.param = e.param().map(str::to_owned);
+        err
+    }
+
+    /// Local inference was unavailable and the ChatGPT plan fallback failed
+    /// too. A usage limit keeps its own 429 code so it is easy to act on.
+    pub fn all_providers_unavailable(local: &ApiError, cloud: &CloudError) -> Self {
+        let local_reason = local.fallback_reason.unwrap_or("ollama_unavailable");
+        let message = format!(
+            "local model unavailable ({local_reason}: {}); ChatGPT plan fallback failed ({}: {})",
+            local.message,
+            cloud.code(),
+            cloud.message()
+        );
+        let mut err = match cloud {
+            CloudError::LimitReached => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "subscription_limit_reached",
+                message,
+            ),
+            _ => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "all_providers_unavailable",
+                message,
+            ),
+        };
+        err.param = cloud.param().map(str::to_owned);
+        err.providers = Some(json!({ "ollama": local_reason, "chatgpt": cloud.code() }));
+        err
+    }
+
     fn body(&self) -> Value {
         let kind = match self.status {
             StatusCode::UNAUTHORIZED => "authentication_error",
+            StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
             s if s.is_client_error() => "invalid_request_error",
             _ => "server_error",
         };
-        json!({
+        let mut body = json!({
             "error": { "message": self.message, "type": kind, "code": self.code, "param": self.param }
-        })
+        });
+        if let Some(providers) = &self.providers {
+            body["error"]["providers"] = providers.clone();
+        }
+        body
     }
 
     /// The error as one SSE frame, for failures after a stream has started.

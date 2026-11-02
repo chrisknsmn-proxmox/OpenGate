@@ -1,4 +1,4 @@
-//! The single upstream: Ollama's OpenAI-compatible API.
+//! The local provider: Ollama's OpenAI-compatible API.
 
 use std::time::Duration;
 
@@ -72,11 +72,19 @@ impl Ollama {
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
                 ApiError::upstream_overloaded()
             }
-            _ => ApiError::upstream_error(format!(
-                "local model server returned HTTP {}{}",
-                status.as_u16(),
-                error_detail(res).await
-            )),
+            _ => {
+                let message = format!(
+                    "local model server returned HTTP {}{}",
+                    status.as_u16(),
+                    error_detail(res).await
+                );
+                // A 4xx is about this request, not about Ollama being down.
+                if status.is_client_error() {
+                    ApiError::upstream_rejected(message)
+                } else {
+                    ApiError::upstream_error(message)
+                }
+            }
         })
     }
 

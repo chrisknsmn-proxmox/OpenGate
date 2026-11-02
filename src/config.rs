@@ -3,10 +3,12 @@
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::PathBuf,
     str::FromStr,
     time::Duration,
 };
 
+use base64::Engine;
 use reqwest::Url;
 use tracing::warn;
 
@@ -29,6 +31,95 @@ pub struct Config {
     pub log_prompt_content: bool,
     /// `None` when Wake-on-LAN is disabled or its configuration is incomplete.
     pub wol: Option<WolConfig>,
+    /// `None` unless `CHATGPT_FALLBACK_ENABLED=true`.
+    pub chatgpt: Option<ChatGptConfig>,
+}
+
+/// The ChatGPT plan fallback (Sign in with ChatGPT, direct Responses API).
+///
+/// There is deliberately no API-key setting: this provider only ever sends
+/// the OAuth access token from `opengate chatgpt login`.
+#[derive(Clone)]
+pub struct ChatGptConfig {
+    /// Encrypted credential file, on a persistent volume.
+    pub credentials_path: PathBuf,
+    pub credentials_key: CredentialsKey,
+    /// `None` = `auto`: the first model in the account's catalog.
+    pub model: Option<String>,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub stream_idle_timeout: Duration,
+    /// After a usage-limit error, new fallback requests fail fast this long.
+    pub limit_pause: Duration,
+    /// Drop sampling hints the ChatGPT plan route rejects instead of failing.
+    pub drop_unsupported_sampling: bool,
+    /// OAuth issuer (OIDC discovery base). Fixed in production; tests point
+    /// it at a mock. Not settable from the environment.
+    pub issuer: Url,
+    /// Responses API base, ending in `/`. Fixed like `issuer`.
+    pub api_base: Url,
+}
+
+pub const CHATGPT_ISSUER: &str = "https://auth.openai.com";
+pub const CHATGPT_API_BASE: &str = "https://api.openai.com/v1/";
+/// The OAuth `resource` for ChatGPT plan inference (no trailing slash).
+pub const CHATGPT_RESOURCE: &str = "https://api.openai.com/v1";
+const DEFAULT_CREDENTIALS_PATH: &str = "/data/chatgpt/credentials.json";
+
+/// 32-byte key for the credential file. Never printed.
+#[derive(Clone)]
+pub struct CredentialsKey(pub(crate) [u8; 32]);
+
+impl FromStr for CredentialsKey {
+    type Err = ();
+
+    /// Standard or URL-safe base64, padded or not, of exactly 32 bytes.
+    fn from_str(s: &str) -> Result<Self, ()> {
+        use base64::engine::general_purpose::{
+            STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
+        };
+        let bytes = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+            .iter()
+            .find_map(|e| e.decode(s).ok())
+            .ok_or(())?;
+        Ok(CredentialsKey(bytes.try_into().map_err(|_| ())?))
+    }
+}
+
+impl fmt::Debug for CredentialsKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl fmt::Debug for ChatGptConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatGptConfig")
+            .field("credentials_path", &self.credentials_path)
+            .field("credentials_key", &self.credentials_key)
+            .field("model", &self.model.as_deref().unwrap_or("auto"))
+            .field("request_timeout", &self.request_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
+            .field("limit_pause", &self.limit_pause)
+            .field("drop_unsupported_sampling", &self.drop_unsupported_sampling)
+            .field("issuer", &self.issuer.as_str())
+            .field("api_base", &self.api_base.as_str())
+            .finish()
+    }
+}
+
+impl ChatGptConfig {
+    /// For the `opengate chatgpt` commands, which work whether or not the
+    /// gateway's fallback is enabled.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let env = Env(lookup);
+        no_api_billing(&env)?;
+        chatgpt_config(&env)
+    }
 }
 
 /// Wake-on-LAN settings for the Ollama host.
@@ -149,6 +240,12 @@ impl Config {
 
         let log_prompt_content = env.bool("LOG_PROMPT_CONTENT")?;
         let wol = wol_config(&env)?;
+        no_api_billing(&env)?;
+        let chatgpt = if env.bool("CHATGPT_FALLBACK_ENABLED")? {
+            Some(chatgpt_config(&env)?)
+        } else {
+            None
+        };
 
         Ok(Config {
             host: env.parse("OPENGATE_HOST", IpAddr::V4(Ipv4Addr::UNSPECIFIED))?,
@@ -165,6 +262,7 @@ impl Config {
             max_concurrent_requests,
             log_prompt_content,
             wol,
+            chatgpt,
         })
     }
 
@@ -188,6 +286,7 @@ impl fmt::Debug for Config {
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("log_prompt_content", &self.log_prompt_content)
             .field("wol", &self.wol)
+            .field("chatgpt", &self.chatgpt)
             .finish()
     }
 }
@@ -244,6 +343,77 @@ fn wol_config<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<Option<WolC
             Ok(None)
         }
     }
+}
+
+/// OpenGate never bills an OpenAI Platform account. The switch exists only so
+/// that turning it on fails loudly instead of being silently ignored.
+fn no_api_billing<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<(), String> {
+    if env.bool("OPENAI_API_BILLING_ENABLED")? {
+        return Err(
+            "OPENAI_API_BILLING_ENABLED=true is not supported: OpenGate only uses local Ollama \
+             and the ChatGPT plan; it never uses OpenAI API keys or API billing"
+                .into(),
+        );
+    }
+    if env.get("OPENAI_API_KEY").is_some() {
+        warn!("OPENAI_API_KEY is set but OpenGate never reads or sends it");
+    }
+    Ok(())
+}
+
+fn chatgpt_config<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<ChatGptConfig, String> {
+    match env.get("CHATGPT_AUTH_METHOD").as_deref() {
+        None | Some("official_oauth") => {}
+        Some(_) => return Err("CHATGPT_AUTH_METHOD must be official_oauth".into()),
+    }
+    match env.get("CHATGPT_PROVIDER").as_deref() {
+        None | Some("responses") => {}
+        Some("codex_app_server") => {
+            return Err("CHATGPT_PROVIDER=codex_app_server is not supported; use \
+                 responses (README: \"Why not Codex app-server\")"
+                .into())
+        }
+        Some(_) => return Err("CHATGPT_PROVIDER must be responses".into()),
+    }
+    let model = match env.get("CHATGPT_MODEL") {
+        None => None,
+        Some(m) if m == "auto" => None,
+        Some(m)
+            if m.len() <= 100
+                && m.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':')) =>
+        {
+            Some(m)
+        }
+        Some(_) => return Err("CHATGPT_MODEL must be auto or a model slug".into()),
+    };
+    let credentials_key = env
+        .required("CHATGPT_CREDENTIALS_KEY")?
+        .parse()
+        .map_err(|_| {
+            "CHATGPT_CREDENTIALS_KEY must be 32 random bytes, base64-encoded \
+             (openssl rand -base64 32)"
+                .to_string()
+        })?;
+    let credentials_path = PathBuf::from(
+        env.get("CHATGPT_CREDENTIALS_PATH")
+            .unwrap_or_else(|| DEFAULT_CREDENTIALS_PATH.into()),
+    );
+    if !credentials_path.is_absolute() || credentials_path.file_name().is_none() {
+        return Err("CHATGPT_CREDENTIALS_PATH must be an absolute file path".into());
+    }
+    Ok(ChatGptConfig {
+        credentials_path,
+        credentials_key,
+        model,
+        connect_timeout: env.seconds("UPSTREAM_CONNECT_TIMEOUT_SECONDS", 3)?,
+        request_timeout: env.seconds("CHATGPT_REQUEST_TIMEOUT_SECONDS", 300)?,
+        stream_idle_timeout: env.seconds("CHATGPT_STREAM_IDLE_TIMEOUT_SECONDS", 120)?,
+        limit_pause: env.seconds("CHATGPT_LIMIT_PAUSE_SECONDS", 300)?,
+        drop_unsupported_sampling: env.bool("CHATGPT_DROP_UNSUPPORTED_SAMPLING")?,
+        issuer: CHATGPT_ISSUER.parse().expect("valid constant"),
+        api_base: CHATGPT_API_BASE.parse().expect("valid constant"),
+    })
 }
 
 impl WolRelayConfig {
@@ -526,6 +696,104 @@ mod tests {
     fn invalid_wol_values_are_ignored_while_disabled() {
         let c = wol(&[("WOL_ENABLED", "false"), ("WOL_MAC_ADDRESS", "nope")]).unwrap();
         assert!(c.wol.is_none());
+    }
+
+    const CRED_KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+
+    fn chatgpt(extra: &[(&'static str, &'static str)]) -> Result<Config, String> {
+        let mut vars = minimal();
+        vars.extend([
+            ("CHATGPT_FALLBACK_ENABLED", "true"),
+            ("CHATGPT_CREDENTIALS_KEY", CRED_KEY),
+        ]);
+        for (k, v) in extra {
+            vars.retain(|(name, _)| name != k);
+            vars.push((k, v));
+        }
+        load(&vars)
+    }
+
+    #[test]
+    fn chatgpt_is_off_by_default() {
+        assert!(load(&minimal()).unwrap().chatgpt.is_none());
+        let c = chatgpt(&[
+            ("CHATGPT_FALLBACK_ENABLED", "false"),
+            ("CHATGPT_CREDENTIALS_KEY", ""),
+        ]);
+        assert!(c.unwrap().chatgpt.is_none());
+    }
+
+    #[test]
+    fn chatgpt_defaults() {
+        let c = chatgpt(&[]).unwrap().chatgpt.unwrap();
+        assert_eq!(
+            c.credentials_path,
+            PathBuf::from("/data/chatgpt/credentials.json")
+        );
+        assert_eq!(c.model, None);
+        assert_eq!(c.issuer.as_str(), "https://auth.openai.com/");
+        assert_eq!(c.api_base.as_str(), "https://api.openai.com/v1/");
+        assert!(!c.drop_unsupported_sampling);
+        let c = chatgpt(&[("CHATGPT_MODEL", "gpt-6.1-sol")])
+            .unwrap()
+            .chatgpt
+            .unwrap();
+        assert_eq!(c.model.as_deref(), Some("gpt-6.1-sol"));
+    }
+
+    #[test]
+    fn api_billing_is_refused() {
+        for vars in [
+            vec![("OPENAI_API_BILLING_ENABLED", "true")],
+            vec![("OPENAI_API_BILLING_ENABLED", "1")],
+        ] {
+            let mut all = minimal();
+            all.extend(vars);
+            assert!(load(&all)
+                .unwrap_err()
+                .contains("OPENAI_API_BILLING_ENABLED"));
+            assert!(ChatGptConfig::from_lookup(|n| all
+                .iter()
+                .find(|(k, _)| *k == n)
+                .map(|(_, v)| v.to_string()))
+            .is_err());
+        }
+        let mut ok = minimal();
+        ok.push(("OPENAI_API_BILLING_ENABLED", "false"));
+        assert!(load(&ok).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_chatgpt_values() {
+        for (k, v) in [
+            ("CHATGPT_CREDENTIALS_KEY", ""),
+            ("CHATGPT_CREDENTIALS_KEY", "short"),
+            ("CHATGPT_CREDENTIALS_KEY", "MDEyMzQ1Njc4OWFiY2RlZg=="),
+            ("CHATGPT_AUTH_METHOD", "api_key"),
+            ("CHATGPT_AUTH_METHOD", "cookies"),
+            ("CHATGPT_PROVIDER", "codex_app_server"),
+            ("CHATGPT_PROVIDER", "openai_api"),
+            ("CHATGPT_MODEL", "gpt 5"),
+            ("CHATGPT_MODEL", "http://evil/"),
+            ("CHATGPT_CREDENTIALS_PATH", "relative/creds.json"),
+            ("CHATGPT_LIMIT_PAUSE_SECONDS", "0"),
+            ("CHATGPT_DROP_UNSUPPORTED_SAMPLING", "maybe"),
+        ] {
+            let err = chatgpt(&[(k, v)])
+                .err()
+                .unwrap_or_else(|| panic!("{k}={v} accepted"));
+            assert!(err.contains(k), "{err}");
+            if k == "CHATGPT_CREDENTIALS_KEY" && !v.is_empty() {
+                assert!(!err.contains(v), "error must not echo the key");
+            }
+        }
+    }
+
+    #[test]
+    fn debug_redacts_credentials_key() {
+        let c = chatgpt(&[]).unwrap();
+        let printed = format!("{c:?}");
+        assert!(printed.contains("<redacted>") && !printed.contains(CRED_KEY));
     }
 
     #[test]

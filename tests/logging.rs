@@ -102,7 +102,52 @@ async fn logs_never_contain_prompts_responses_or_keys() {
         assert_eq!(res.status(), 200);
     }
 
+    // A ChatGPT plan fallback with a token refresh and a usage-limit error.
+    let m = common::chatgpt::mock().await;
+    let path = common::chatgpt::temp_path();
+    common::chatgpt::seed(
+        &path,
+        Some(common::chatgpt::account(10, common::chatgpt::PLAN_SCOPES)),
+    );
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let cfg = common::chatgpt::config_with(dead, Some(&m), &path, &[]);
+    let base = format!("http://{}", serve(opengate::app(cfg)).await);
+    let send = |stream: bool| {
+        http.post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(common::KEY)
+            .json(&json!({ "model": "opengate/local", "messages": messages, "stream": stream }))
+            .send()
+    };
+    let res = send(false).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(res.text().await.unwrap().contains(common::chatgpt::REPLY));
+    assert_eq!(send(true).await.unwrap().status(), 200);
+    m.set_inference(common::chatgpt::Inference::LimitHttp);
+    assert_eq!(send(false).await.unwrap().status(), 429);
+
     let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    for event in [
+        "refreshing ChatGPT access token",
+        "trying the ChatGPT plan fallback",
+        "serving request from the ChatGPT plan",
+        "ChatGPT plan usage limit reached",
+    ] {
+        assert!(logs.contains(event), "missing log {event:?}:\n{logs}");
+    }
+    for secret in [
+        "access-0",
+        "refresh-0",
+        "access-1",
+        "refresh-1",
+        "Hello from",
+        common::chatgpt::CRED_KEY,
+    ] {
+        assert!(!logs.contains(secret), "log leaked {secret:?}:\n{logs}");
+    }
     assert!(
         logs.contains("path=/v1/chat/completions status=200"),
         "requests are logged:\n{logs}"
