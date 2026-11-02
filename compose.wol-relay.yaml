@@ -1,0 +1,38 @@
+# Host-side Wake-on-LAN relay for OpenGate running on a Docker bridge network.
+# Broadcasts from a bridge container never reach the LAN (README:
+# "Wake-on-LAN from Docker"), so this small process on the host does it.
+#
+# Deploy it as its own Coolify resource on the same server as OpenGate, or:
+#   docker compose -f compose.wol-relay.yaml up -d --build
+#
+# It only ever broadcasts the magic packet for WOL_MAC_ADDRESS, and only when
+# it receives exactly that packet, so the most anyone can do with it is wake
+# that one PC, which any device on the LAN can already do.
+# Its own project name, so it and compose.yaml (same directory) don't treat
+# each other's containers as orphans.
+name: opengate-wol-relay
+services:
+  wol-relay:
+    build: .
+    command: ["opengate", "wol-relay"]
+    restart: unless-stopped
+    # Host networking is what lets the broadcast reach the LAN. It needs no
+    # privileges or capabilities: the relay listens on an unprivileged port.
+    network_mode: host
+    environment:
+      WOL_MAC_ADDRESS: ${WOL_MAC_ADDRESS:?WOL_MAC_ADDRESS is required}
+      WOL_BROADCAST_ADDRESS: ${WOL_BROADCAST_ADDRESS:?WOL_BROADCAST_ADDRESS is required}
+      WOL_PORT: ${WOL_PORT:-9}
+      # Docker's default bridge gateway: reachable from containers on this
+      # host (as host.docker.internal), not from the LAN.
+      WOL_RELAY_LISTEN: ${WOL_RELAY_LISTEN:-172.17.0.1:9009}
+      RUST_LOG: ${RUST_LOG:-info}
+    # The image's healthcheck probes OpenGate's HTTP port, which the relay
+    # does not serve.
+    healthcheck:
+      disable: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

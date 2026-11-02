@@ -1,7 +1,12 @@
 //! Log privacy. A separate test binary so a global subscriber captures every
 //! task, at every level, including hyper's and reqwest's own trace output.
 
-use std::sync::{Arc, Mutex};
+mod common;
+
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{routing::post, Json, Router};
 use opengate::Config;
@@ -22,12 +27,7 @@ impl std::io::Write for Capture {
     }
 }
 
-async fn serve(router: Router) -> std::net::SocketAddr {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    addr
-}
+use common::serve;
 
 #[tokio::test]
 async fn logs_never_contain_prompts_responses_or_keys() {
@@ -84,12 +84,41 @@ async fn logs_never_contain_prompts_responses_or_keys() {
         401
     );
 
+    // A full Wake-on-LAN cycle is logged, still without secrets.
+    let pc = common::pc(common::Power::Asleep(Some(Duration::from_millis(100)))).await;
+    let base = format!(
+        "http://{}",
+        serve(opengate::app(common::config(&pc, true))).await
+    );
+    for _ in 0..2 {
+        // The first request wakes the PC; the second finds it online.
+        let res = http
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(common::KEY)
+            .json(&json!({ "model": "opengate/local", "messages": messages }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
     let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert!(
         logs.contains("path=/v1/chat/completions status=200"),
         "requests are logged:\n{logs}"
     );
-    for secret in [prompt, reply, KEY, "wrong-key-attempt"] {
+    for event in [
+        "Ollama connectivity check: unreachable",
+        "sent Wake-on-LAN magic packet",
+        "waiting for the Ollama host to start",
+        "Ollama not reachable yet",
+        "Ollama became available after wake",
+        "resuming request after wake",
+        "Ollama connectivity check: online",
+    ] {
+        assert!(logs.contains(event), "missing log {event:?}:\n{logs}");
+    }
+    for secret in [prompt, reply, KEY, common::KEY, "wrong-key-attempt"] {
         assert!(!logs.contains(secret), "log leaked {secret:?}:\n{logs}");
     }
 }

@@ -13,6 +13,7 @@ use crate::{config::Config, error::ApiError};
 const PROBE_GRACE: Duration = Duration::from_secs(2);
 const MAX_ERROR_DETAIL: usize = 200;
 
+#[derive(Clone)]
 pub(crate) struct Ollama {
     http: reqwest::Client,
     chat_url: Url,
@@ -79,6 +80,30 @@ impl Ollama {
         })
     }
 
+    pub fn probe_timeout(&self) -> Duration {
+        self.probe_timeout
+    }
+
+    /// Connectivity check for Wake-on-LAN: does anything answer `/api/tags`?
+    /// Any HTTP response means the host is awake (waking it cannot help), so
+    /// only transport failures count as unreachable.
+    pub async fn reachable(&self, timeout: Duration) -> Result<(), &'static str> {
+        let res = self
+            .http
+            .get(self.tags_url.clone())
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(probe_failure)?;
+        if !res.status().is_success() {
+            warn!(
+                upstream_status = res.status().as_u16(),
+                "Ollama is reachable but /api/tags returned an error"
+            );
+        }
+        Ok(())
+    }
+
     /// Bounded readiness check: is Ollama reachable and is the model installed?
     pub async fn probe(&self) -> Result<(), &'static str> {
         let res = self
@@ -87,15 +112,7 @@ impl Ollama {
             .timeout(self.probe_timeout)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_connect() {
-                    "upstream_unreachable"
-                } else if e.is_timeout() {
-                    "upstream_timeout"
-                } else {
-                    "upstream_error"
-                }
-            })?;
+            .map_err(probe_failure)?;
         if !res.status().is_success() {
             return Err("upstream_error");
         }
@@ -111,6 +128,16 @@ impl Ollama {
         } else {
             Err("model_not_installed")
         }
+    }
+}
+
+fn probe_failure(e: reqwest::Error) -> &'static str {
+    if e.is_connect() {
+        "upstream_unreachable"
+    } else if e.is_timeout() {
+        "upstream_timeout"
+    } else {
+        "upstream_error"
     }
 }
 

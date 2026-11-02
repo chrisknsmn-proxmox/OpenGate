@@ -17,6 +17,20 @@ services:
       MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-2}
       RUST_LOG: ${RUST_LOG:-info}
       LOG_PROMPT_CONTENT: ${LOG_PROMPT_CONTENT:-false}
+      # Wake-on-LAN (README: "Wake-on-LAN"). Off unless WOL_ENABLED=true.
+      # On this bridge network a broadcast cannot reach the LAN, so set
+      # WOL_RELAY_ADDRESS and run compose.wol-relay.yaml on the same host.
+      WOL_ENABLED: ${WOL_ENABLED:-false}
+      WOL_MAC_ADDRESS: ${WOL_MAC_ADDRESS:-}
+      WOL_BROADCAST_ADDRESS: ${WOL_BROADCAST_ADDRESS:-}
+      WOL_PORT: ${WOL_PORT:-9}
+      WOL_RELAY_ADDRESS: ${WOL_RELAY_ADDRESS:-}
+      WOL_STARTUP_TIMEOUT_SECONDS: ${WOL_STARTUP_TIMEOUT_SECONDS:-90}
+      WOL_POLL_INTERVAL_SECONDS: ${WOL_POLL_INTERVAL_SECONDS:-3}
+      WOL_RETRY_COOLDOWN_SECONDS: ${WOL_RETRY_COOLDOWN_SECONDS:-30}
+    # Lets WOL_RELAY_ADDRESS=host.docker.internal:9009 reach the host-side relay.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Internal only; Coolify's proxy is the one public entry point.
     expose:
       - "8000"

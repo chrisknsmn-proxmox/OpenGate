@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use opengate::Config;
+use opengate::{Config, WolRelay, WolRelayConfig};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -22,6 +22,10 @@ async fn main() -> ExitCode {
         )
         .with_ansi(std::io::stdout().is_terminal())
         .init();
+
+    if std::env::args().nth(1).as_deref() == Some("wol-relay") {
+        return wol_relay().await;
+    }
 
     let config = match Config::from_env() {
         Ok(config) => config,
@@ -51,6 +55,29 @@ async fn main() -> ExitCode {
     {
         error!("server error: {e}");
         return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Host-side Wake-on-LAN relay; see README "Wake-on-LAN from Docker".
+async fn wol_relay() -> ExitCode {
+    let config = match WolRelayConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            error!("invalid configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let relay = match WolRelay::bind(config.clone()).await {
+        Ok(relay) => relay,
+        Err(e) => {
+            error!(listen = %config.listen, "cannot listen: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::select! {
+        () = relay.run() => {}
+        () = shutdown() => {}
     }
     ExitCode::SUCCESS
 }

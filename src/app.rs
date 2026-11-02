@@ -19,7 +19,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 use tracing::info;
 
-use crate::{config::Config, error::ApiError, relay::relay, upstream::Ollama, validate};
+use crate::{config::Config, error::ApiError, relay::relay, upstream::Ollama, validate, wol::Wol};
 
 /// Large enough for a long agent conversation; anything bigger is refused with 413.
 const MAX_BODY_BYTES: usize = 4 << 20;
@@ -27,13 +27,16 @@ const MAX_BODY_BYTES: usize = 4 << 20;
 struct AppState {
     config: Config,
     ollama: Ollama,
+    wol: Option<Wol>,
     permits: Arc<Semaphore>,
     started: u64,
 }
 
 pub fn app(config: Config) -> Router {
+    let ollama = Ollama::new(&config);
     let state = Arc::new(AppState {
-        ollama: Ollama::new(&config),
+        wol: config.wol.clone().map(|wol| Wol::new(wol, ollama.clone())),
+        ollama,
         permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
         started: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -126,6 +129,11 @@ async fn chat(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::overloaded())?;
+    // Only authenticated, valid inference requests reach this point, so
+    // nothing else can wake the Ollama host. Covers streaming and not.
+    if let Some(wol) = &s.wol {
+        wol.ensure_ready().await?;
+    }
     let stream = req.stream;
     let res = s
         .ollama
