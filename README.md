@@ -8,7 +8,7 @@ official [Sign in with ChatGPT](#chatgpt-plan-fallback) flow. OpenGate has no
 OpenAI API-key or API-billing path at all.
 
 ```
-App / AI agent ──► OpenGate (Coolify VM 104, :8000) ── authenticate client
+App / AI agent ──► OpenGate (Coolify VM 104, :8100) ── authenticate client
                         │
                         ├─► Ollama on 192.168.1.50 (llama3.1:8b) ── available ──► local answer
                         │      └─ unreachable ─► Wake-on-LAN ─► wait ─► up ──► local answer
@@ -147,6 +147,7 @@ on another provider.
 | `OPENGATE_VIRTUAL_MODEL` | `opengate/local` | The only model id clients may send. |
 | `OPENGATE_HOST` | `0.0.0.0` | Listen address. |
 | `OPENGATE_PORT` | `8000` | Listen port. |
+| `OPENGATE_PUBLISH_ADDRESS`, `OPENGATE_PUBLISH_PORT` | `127.0.0.1`, `8100` | Docker only: host address and port compose publishes the container on. Never `8000` on the Coolify server (its dashboard uses it). |
 | `UPSTREAM_CONNECT_TIMEOUT_SECONDS` | `3` | TCP connect to Ollama. |
 | `UPSTREAM_REQUEST_TIMEOUT_SECONDS` | `120` | Overall cap per request, **including a whole stream**. Raise it for very long generations. |
 | `UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS` | `60` | Max gap between stream chunks. |
@@ -758,16 +759,18 @@ never forward it to the Internet.
 ### Run in Docker locally
 
 ```bash
-cp .env.example .env   # then set OPENGATE_API_KEY
-docker compose -f compose.yaml -f compose.dev.yaml up --build -d
+cp .env.example .env   # then set OPENGATE_API_KEY and OLLAMA_BASE_URL
+docker compose up --build -d
+docker compose logs -f opengate
 ```
 
-`compose.dev.yaml` publishes on `127.0.0.1:8000` only. The container runs as
+By default it publishes on `127.0.0.1:8100` only (`OPENGATE_PUBLISH_ADDRESS`,
+`OPENGATE_PUBLISH_PORT`); inside the container it listens on 8000. The container runs as
 uid 10001 with a read-only root filesystem, all capabilities dropped and
 `no-new-privileges`. Test the **container's** path to Ollama, not just the host's:
 
 ```bash
-curl -s --max-time 10 http://127.0.0.1:8000/health/ready   # probe runs from inside the container
+curl -s --max-time 10 http://127.0.0.1:8100/health/ready   # probe runs from inside the container
 ```
 
 For Wake-on-LAN in Docker, also start the relay, and set `WOL_ENABLED=true` and
@@ -775,14 +778,14 @@ For Wake-on-LAN in Docker, also start the relay, and set `WOL_ENABLED=true` and
 
 ```bash
 docker compose -f compose.wol-relay.yaml up -d --build
-docker compose -f compose.yaml -f compose.dev.yaml up --build -d
+docker compose up --build -d
 ```
 
 ### Smoke tests
 
 ```bash
 set -a; . ./.env; set +a
-B=http://127.0.0.1:8000
+B=http://127.0.0.1:8100        # Docker; use :8000 for `cargo run`, or the Coolify URL
 
 curl -i $B/health/live
 curl -i $B/v1/models -H "Authorization: Bearer $OPENGATE_API_KEY"
@@ -809,6 +812,20 @@ curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
 2. Under **Environment Variables**, set `OPENGATE_API_KEY` (as a secret; use a
    different value from your dev `.env`) and `OLLAMA_BASE_URL`. Coolify blocks
    deployment until both are filled in. The other variables have defaults.
+
+   **Ports.** Coolify's own dashboard already uses host port **8000** on this
+   server, so OpenGate must never be published there. The container listens
+   on 8000 internally, and compose publishes it on host port
+   `OPENGATE_PUBLISH_PORT` (default `8100`). To reach it straight from the LAN
+   (e.g. from your Mac), also set:
+
+   ```
+   OPENGATE_PUBLISH_ADDRESS=<VM 104's LAN IP>
+   OPENGATE_PUBLISH_PORT=8100
+   ```
+   Left unset, it is published on the server's loopback only, and only the
+   domain from step 3 reaches it.
+
    For Wake-on-LAN, also set:
 
    ```
@@ -830,8 +847,11 @@ curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
    encrypted credentials live. Coolify keeps named volumes across restarts and
    redeploys. Check that it appears under the resource's **Storages**, and never
    delete it, or you will have to sign in again.
-3. Under **Domains**, add a domain for service `opengate` with the internal
-   port suffix, e.g. `https://opengate.<your-domain>:8000`. Keep it reachable
+3. Optional. Under **Domains**, add a domain for service `opengate` with the internal
+   port suffix, e.g. `https://opengate.<your-domain>:8000`. Here `:8000` only
+   tells Coolify's proxy which **container** port to forward to; clients use
+   `https://opengate.<your-domain>` on 443, and it does not touch the dashboard's
+   host port 8000. The name must resolve to VM 104 (DNS or `/etc/hosts`). Keep it reachable
    only from trusted networks (LAN/VPN or proxy allowlist); it is the single
    protected endpoint. Never publish Ollama's port.
 4. **Wake-on-LAN relay.** Add a second resource on the same server (VM 104):
@@ -864,6 +884,24 @@ curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
      until you [sign in](#sign-in-first-time-headless-coolify-from-your-mac), then `authorized`.
 6. **Sign in** once, then run `opengate chatgpt test`. See
    [End-to-end fallback test](#end-to-end-fallback-test).
+
+### Test from your Mac
+
+Run the [smoke tests](#smoke-tests) from the Mac with `B` pointing at the
+deployment and the **Coolify** API key (not your dev one):
+
+```bash
+export OPENGATE_API_KEY='<Coolify value>'
+B=http://<VM 104's LAN IP>:8100      # direct, needs OPENGATE_PUBLISH_ADDRESS
+# B=https://opengate.<your-domain>   # via Coolify's proxy, if you added a domain
+curl -i $B/health/providers
+```
+
+`/health/ready` must return 200 (Coolify's container can reach Ollama), and a
+chat request should come back with `x-opengate-provider: ollama`. If the
+connection is refused, check `docker ps` on VM 104 shows
+`<VM 104's LAN IP>:8100->8000/tcp` for the OpenGate container; if it hangs, a
+firewall on VM 104 (ufw) or between subnets is blocking 8100.
 
 ### Test Wake-on-LAN from inside the production container
 
