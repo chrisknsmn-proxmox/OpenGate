@@ -1,15 +1,23 @@
-FROM rust:1.92-slim-trixie AS build
-WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-RUN cargo build --release --locked
+# Base images are pinned by digest; dependencies by Cargo.lock (--locked).
+# To update: docker pull <image:tag>, then copy its digest here.
 
-FROM debian:trixie-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM rust:1.92-slim-trixie@sha256:bf3368a992915f128293ac76917ab6e561e4dda883273c8f5c9f6f8ea37a378e AS build
+WORKDIR /app
+
+# Build dependencies alone first so code changes don't rebuild them.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+
+COPY src ./src
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin opengate
 COPY --from=build /app/target/release/opengate /usr/local/bin/opengate
-USER nobody
-EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=3s CMD curl -fsS http://localhost:${PORT:-8080}/health || exit 1
+USER 10001:10001
+EXPOSE 8000
+# The binary checks its own /health/live, so the image needs no curl.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["opengate", "healthcheck"]
 CMD ["opengate"]

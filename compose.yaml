@@ -1,0 +1,33 @@
+# OpenGate only — no database, no Ollama. Used as-is by Coolify.
+# For local testing, also load compose.dev.yaml (publishes to loopback only).
+services:
+  opengate:
+    build: .
+    restart: unless-stopped
+    environment:
+      OPENGATE_API_KEY: ${OPENGATE_API_KEY:?OPENGATE_API_KEY is required}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:?OLLAMA_BASE_URL is required}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      OPENGATE_VIRTUAL_MODEL: ${OPENGATE_VIRTUAL_MODEL:-opengate/local}
+      OPENGATE_HOST: 0.0.0.0
+      OPENGATE_PORT: "8000"
+      UPSTREAM_CONNECT_TIMEOUT_SECONDS: ${UPSTREAM_CONNECT_TIMEOUT_SECONDS:-3}
+      UPSTREAM_REQUEST_TIMEOUT_SECONDS: ${UPSTREAM_REQUEST_TIMEOUT_SECONDS:-120}
+      UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS: ${UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS:-60}
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-2}
+      RUST_LOG: ${RUST_LOG:-info}
+      LOG_PROMPT_CONTENT: ${LOG_PROMPT_CONTENT:-false}
+    # Internal only; Coolify's proxy is the one public entry point.
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "opengate", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
