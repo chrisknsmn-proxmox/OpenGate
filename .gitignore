@@ -5,3 +5,14 @@
 *.swp
 *.swo
 *~
+
+# Secrets and credential stores (enforced by .githooks/scan-secrets.sh).
+credentials*.json
+/data/
+*.pem
+!tests/fixtures/test_id_token_key.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*

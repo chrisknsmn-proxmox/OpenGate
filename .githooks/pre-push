@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Rescans every commit about to be pushed, so a `git commit --no-verify`
+# or a commit made before the hooks were enabled cannot slip through.
+set -euo pipefail
+scan="$(git rev-parse --show-toplevel)/.githooks/scan-secrets.sh"
+zero=0000000000000000000000000000000000000000
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [[ $local_sha == "$zero" ]] && continue          # deleting a branch
+  if [[ $remote_sha == "$zero" ]]; then
+    range="$local_sha --not --remotes"             # new branch: unpushed commits
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  "$scan" range "$range"
+done

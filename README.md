@@ -154,7 +154,7 @@ on another provider.
 | `RUST_LOG` | `info` | Log filter. `info` logs method, path, status, latency and failure codes only. |
 | `LOG_PROMPT_CONTENT` | `false` | `true` logs request messages (never responses). Debugging only; warns at startup. |
 | `WOL_ENABLED` | `false` | `true` turns on [Wake-on-LAN](#wake-on-lan). |
-| `WOL_MAC_ADDRESS` | — | MAC of the PC's wired NIC, `AA:BB:CC:DD:EE:64` or `08-BF-…`. Must be a unicast address. |
+| `WOL_MAC_ADDRESS` | — | MAC of the PC's wired NIC, `AA:BB:CC:DD:EE:64` or `AA-BB-CC-DD-EE-64`. Must be a unicast address. |
 | `WOL_BROADCAST_ADDRESS` | — | LAN broadcast address, e.g. `192.168.1.255`. Used when OpenGate sends the packet itself. |
 | `WOL_PORT` | `9` | UDP port for the magic packet (9 or 7 are conventional). |
 | `WOL_STARTUP_TIMEOUT_SECONDS` | `90` | How long to wait for Ollama after waking (1–3600). |
@@ -622,6 +622,34 @@ docker logs -f <opengate-container> 2>&1 | grep -E 'wol|Wake|ChatGPT|chat/comple
 
 
 ## Development (Ubuntu VM)
+
+### Secret guard (do this first in every clone)
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This turns on `.githooks/pre-commit` and `.githooks/pre-push`. Both run
+`.githooks/scan-secrets.sh` and refuse the commit or push if it adds:
+
+- a secret-bearing file: `.env` or `.env.*` (anything except `.env.example`),
+  `*.pem`/`*.key`/`*.p12`, SSH keys, `credentials*.json`;
+- any value from your local `.env`, including the host of URL values and the
+  first octets of `WOL_MAC_ADDRESS`. Values that also appear in `.env.example`
+  are public defaults and are allowed;
+- a known credential format: private keys, OpenAI/Anthropic/GitHub/AWS/Slack/Google
+  tokens, JWTs, URLs with passwords, long literal secrets assigned to
+  key/token/password names.
+
+The pre-push hook rescans every commit being pushed, so a `git commit --no-verify`
+is still caught. Findings show the file, line and kind, never the value. Real
+LAN details (IPs, MACs, hostnames) belong in `.env`, never in docs or code; use
+`192.168.1.50`/`AA:BB:CC:DD:EE:64`-style placeholders. For a reviewed false
+positive, put `opengate:allow-secret` on that line or add it to
+`.githooks/secret-allowlist`. Scan by hand with `.githooks/scan-secrets.sh staged`
+or `.githooks/scan-secrets.sh range origin/main..HEAD`.
+
+### Build and test
 
 The VM has Docker but no Rust toolchain. Either install Rust for your user:
 

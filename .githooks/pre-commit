@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Blocks commits that add secrets or private details. See scan-secrets.sh.
+exec "$(git rev-parse --show-toplevel)/.githooks/scan-secrets.sh" staged
