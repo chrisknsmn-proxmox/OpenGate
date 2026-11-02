@@ -147,7 +147,7 @@ on another provider.
 | `OPENGATE_VIRTUAL_MODEL` | `opengate/local` | The only model id clients may send. |
 | `OPENGATE_HOST` | `0.0.0.0` | Listen address. |
 | `OPENGATE_PORT` | `8000` | Listen port. |
-| `OPENGATE_PUBLISH_ADDRESS`, `OPENGATE_PUBLISH_PORT` | `127.0.0.1`, `8100` | Docker only: host address and port compose publishes the container on. Never `8000` on the Coolify server (its dashboard uses it). |
+| `OPENGATE_PUBLISH_ADDRESS`, `OPENGATE_PUBLISH_PORT` | **required** (compose), `8100` | Docker only: host address and port compose publishes the container on. Never `8000` on the Coolify server (its dashboard uses it). |
 | `UPSTREAM_CONNECT_TIMEOUT_SECONDS` | `3` | TCP connect to Ollama. |
 | `UPSTREAM_REQUEST_TIMEOUT_SECONDS` | `120` | Overall cap per request, **including a whole stream**. Raise it for very long generations. |
 | `UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS` | `60` | Max gap between stream chunks. |
@@ -760,12 +760,13 @@ never forward it to the Internet.
 
 ```bash
 cp .env.example .env   # then set OPENGATE_API_KEY and OLLAMA_BASE_URL
+                       # (OPENGATE_PUBLISH_ADDRESS=127.0.0.1 is required for compose)
 docker compose up --build -d
 docker compose logs -f opengate
 ```
 
-By default it publishes on `127.0.0.1:8100` only (`OPENGATE_PUBLISH_ADDRESS`,
-`OPENGATE_PUBLISH_PORT`); inside the container it listens on 8000. The container runs as
+With `OPENGATE_PUBLISH_ADDRESS=127.0.0.1` it publishes on `127.0.0.1:8100`
+only (`OPENGATE_PUBLISH_PORT`); inside the container it listens on 8000. The container runs as
 uid 10001 with a read-only root filesystem, all capabilities dropped and
 `no-new-privileges`. Test the **container's** path to Ollama, not just the host's:
 
@@ -816,15 +817,14 @@ curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
    **Ports.** Coolify's own dashboard already uses host port **8000** on this
    server, so OpenGate must never be published there. The container listens
    on 8000 internally, and compose publishes it on host port
-   `OPENGATE_PUBLISH_PORT` (default `8100`). To reach it straight from the LAN
-   (e.g. from your Mac), also set:
+   `OPENGATE_PUBLISH_PORT` (default `8100`) at `OPENGATE_PUBLISH_ADDRESS`,
+   which is **required**: Coolify will not deploy without it, so a redeploy
+   can never silently move the API off the LAN. Set:
 
    ```
    OPENGATE_PUBLISH_ADDRESS=<VM 104's LAN IP>
    OPENGATE_PUBLISH_PORT=8100
    ```
-   Left unset, it is published on the server's loopback only, and only the
-   domain from step 3 reaches it.
 
    For Wake-on-LAN, also set:
 
@@ -947,6 +947,155 @@ resource; the images run `opengate` and `opengate wol-relay`).
    ```
 
    A second request right after should log no packet.
+
+## Automatic deployment
+
+Every push to `main` deploys to Coolify without touching the dashboard:
+
+```
+push to main ──► GitHub
+                   ▲  outbound HTTPS, once a minute: "what is main now?"
+VM 104 ── opengate-autodeploy.timer
+   │   new commit?
+   └─► POST <Coolify Deploy Webhook> (LAN, Bearer token with `deploy` only)
+          └─► Coolify: pull main ─► docker compose build ─► recreate opengate
+                                                       └─► healthcheck /health/live
+```
+
+**Why not Coolify's GitHub webhook?** Both of Coolify's push mechanisms (the
+GitHub App, and a manual repository webhook) need GitHub's servers to reach
+Coolify over the Internet. Coolify here is on a private LAN, so that would
+mean publishing the dashboard host, or a tunnel. Instead a small systemd timer
+on VM 104 asks GitHub for the tip of `main` (outbound only; no API token, no
+rate limit) and, when it changes, calls Coolify's own **Deploy Webhook** on the
+LAN. Nothing is exposed, GitHub holds no secrets, and it works whatever source
+the Coolify application uses (GitHub App, public URL or deploy key). Deploys
+start within about a minute of the push. A self-hosted GitHub Actions runner
+was ruled out because this repository is public, and GitHub advises against
+self-hosted runners on public repositories (a fork's pull request could run
+code on your LAN).
+
+### One-time setup
+
+**In Coolify** (dashboard on VM 104, port 8000):
+
+1. Open the OpenGate application. On its **General** page, check **Source**:
+   GitHub App, public repository, or deploy key all work, as long as
+   **Branch** is `main`, **Build Pack** is Docker Compose and the compose file
+   is `/compose.yaml`.
+2. **Environment Variables**: confirm `OPENGATE_PUBLISH_ADDRESS` (VM 104's LAN
+   IP) and `OPENGATE_PUBLISH_PORT=8100` are set, next to `OPENGATE_API_KEY`,
+   the Ollama, WOL and ChatGPT values. They are stored in Coolify, not Git, so
+   every deployment reuses them.
+3. Enable the API if it is off: **Settings → Advanced → API Access** (the label
+   varies by version; a disabled API answers `API is disabled`).
+4. **Keys & Tokens → API tokens → Create**: name `opengate-autodeploy`, the
+   **deploy** permission only, and the team that owns OpenGate. Copy the token;
+   it is shown once.
+5. Back in the application: **Webhooks → Deploy Webhook**. Copy that URL
+   (`http://<coolify>/api/v1/deploy?uuid=<application uuid>&force=false`).
+6. Optional: **Advanced → Deployment → Auto deploy → Manual deployments only**.
+   The Deploy Webhook works regardless, and this avoids a double deployment if
+   a GitHub webhook is ever added later.
+
+**On VM 104** (needs `curl` and systemd):
+
+```bash
+curl -fsSL https://github.com/chrisknsmn-proxmox/OpenGate/archive/refs/heads/main.tar.gz | tar xz
+cd OpenGate-main/deploy/autodeploy && sudo ./install.sh
+# paste the Deploy Webhook URL, then the token (hidden)
+```
+
+It installs `/usr/local/bin/opengate-autodeploy`, the service and timer, and
+`/etc/opengate-autodeploy/{config,coolify-token}` (root, `0600`). The service
+runs as a throwaway unprivileged user that receives the token as a systemd
+credential and can write only `/var/lib/opengate-autodeploy`. The first run
+records the current commit as a baseline; it does not redeploy.
+
+### Verify it with a real push
+
+```bash
+# dev VM
+git commit --allow-empty -m "Test automatic deployment" && git push origin main
+```
+
+```bash
+# VM 104: within a minute
+journalctl -u opengate-autodeploy -f
+#   new commit on main: 6191409 -> 1a2b3c4; requesting a Coolify deployment
+#   Coolify accepted the deployment of 1a2b3c4: {"deployments":[...]}
+```
+
+Then in Coolify, **Deployments** shows a new deployment for that commit with
+the Rust build in its log, and the container ends **healthy**. From any LAN
+machine, `curl http://<VM 104's LAN IP>:8100/health/live` returns 200 and
+`/v1/models` with your key returns the model. Only after that has worked is
+automatic deployment confirmed.
+
+### Health, failures and what survives a deployment
+
+- The container healthcheck is `opengate healthcheck`, which calls
+  `/health/live`: it does not depend on Ollama, so a sleeping PC never fails a
+  deployment or restarts the container. Use `/health/ready` or
+  `/health/providers` to check Ollama.
+- Coolify builds the new image before recreating the container, so a failing
+  `cargo build` should leave the running version in place; the deployment shows
+  **Failed**. Confirm that on your Coolify version before relying on it, and
+  run the [Before committing](#build-and-test) checks before you push.
+- Kept across every deployment: all Coolify environment variables (API key,
+  Ollama, WOL, ChatGPT, publish address), the `opengate-data` volume with the
+  encrypted ChatGPT credentials, and the networks. Nothing in Git overrides
+  them. Never delete the volume under **Storages**.
+- If a deployment request fails (Coolify down, token revoked), the timer logs
+  it and retries every minute; it records a commit only once Coolify accepts it.
+
+### Roll back
+
+- **Preferred:** revert in Git and push. That deploys the previous code the
+  same way, and history shows what happened:
+  ```bash
+  git revert <bad commit> && git push origin main
+  ```
+- **Immediately, without Git:** if your Coolify version offers **Rollback** for
+  this application, pick the previous image there. Then pause automatic
+  deployment (below) until `main` is fixed, or the next poll will redeploy the
+  tip of `main` only when it changes again.
+
+### Pause or remove
+
+- Pause: `sudo systemctl disable --now opengate-autodeploy.timer`
+  (resume: `sudo systemctl enable --now opengate-autodeploy.timer`).
+- Remove completely: `sudo ./install.sh --uninstall`, then delete the
+  `opengate-autodeploy` token in Coolify.
+- Manual deployment from the Coolify dashboard always keeps working.
+
+### Secrets
+
+The only new secret is the Coolify API token. It lives on VM 104 only
+(`/etc/opengate-autodeploy/coolify-token`), has the `deploy` permission only,
+and is passed to `curl` on stdin, never on the command line or in logs. GitHub
+stores nothing. Rotate it by creating a new token, writing it to that file and
+deleting the old one in Coolify.
+
+### Troubleshooting
+
+| Symptom (`journalctl -u opengate-autodeploy`) | Cause and fix |
+|---|---|
+| `could not read … from GitHub` | VM 104 has no outbound HTTPS or DNS, or `BRANCH`/`REPO` in `/etc/opengate-autodeploy/config` is wrong. |
+| `Coolify answered HTTP 401` / `400` | Token wrong, expired or deleted. Create a new one with **deploy** permission. |
+| `Coolify answered HTTP 403` / `API is disabled` | Enable API access in Coolify settings, or the token's team does not own the app. |
+| `Coolify answered HTTP 404` | Wrong application uuid; copy the Deploy Webhook URL again. |
+| `cannot reach Coolify` | The URL uses a hostname/IP not reachable from VM 104 itself; use `http://127.0.0.1:8000/api/v1/deploy?…`. |
+| Nothing logged after a push | `systemctl list-timers opengate-autodeploy.timer` should show the next run; the push may not be on `main`. |
+| Deployment fails: `OPENGATE_PUBLISH_ADDRESS is required` | Set it in the application's environment variables, then deploy. |
+| Deployed, but `:8100` refuses connections | `docker ps` on VM 104 should show `<LAN IP>:8100->8000/tcp`; fix `OPENGATE_PUBLISH_ADDRESS`. |
+
+**Alternative, if you later want instant, native webhooks:** expose only
+Coolify's webhook path (`/webhooks/source/github/events/manual`) through an
+authenticated tunnel such as Cloudflare Tunnel with a path-restricted ingress
+rule, add a GitHub repository webhook with a long random secret (Coolify →
+**Webhooks → Manual Git webhooks → GitHub**), and set **Auto deploy** to
+**Deploy on push (webhooks)**. Never forward the dashboard or OpenGate's port.
 
 ## Using OpenGate from OpenClaw (optional)
 

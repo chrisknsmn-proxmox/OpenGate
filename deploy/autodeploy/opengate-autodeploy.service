@@ -1,0 +1,22 @@
+[Unit]
+Description=Deploy new OpenGate commits to Coolify
+Documentation=https://github.com/chrisknsmn-proxmox/OpenGate#automatic-deployment
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/opengate-autodeploy/config
+# Copied into a private, per-run directory; the service never reads /etc directly.
+LoadCredential=coolify-token:/etc/opengate-autodeploy/coolify-token
+ExecStart=/usr/local/bin/opengate-autodeploy
+# Unprivileged throwaway user; only the state directory is writable.
+DynamicUser=yes
+StateDirectory=opengate-autodeploy
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

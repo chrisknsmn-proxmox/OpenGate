@@ -9,7 +9,8 @@
 # It blocks:
 #   1. Secret-bearing files (.env, keys, credential stores) being added.
 #   2. Any value from your local .env / .env.* appearing in added lines,
-#      including the host of URL values and the vendor prefix of MACs.
+#      including the host of URL values and the first octets of MACs, plus
+#      anything listed in .git/info/private-values (never committed).
 #      Values that also appear in .env.example (public defaults) are ignored.
 #   3. Common credential formats (private keys, OpenAI/GitHub/AWS/Slack/Google
 #      tokens, JWTs, long literal secrets assigned to key/token/password names).
@@ -92,13 +93,13 @@ done < "$work/paths"
 
 # 2. Real values from local env files.
 example_values=$(sed -n 's/^[A-Za-z_][A-Za-z0-9_]*=//p' .env.example 2>/dev/null || true)
-check_value() { # label, value
-  local label=$1 v=$2
+check_value() { # finding kind, value
+  local kind=$1 v=$2
   [[ ${#v} -lt 6 ]] && return 0
   [[ $v =~ ^[0-9]+(\.[0-9]+)?$ || $v =~ ^(true|false|info|debug|warn|error)$ ]] && return 0
   printf '%s\n' "$example_values" | g -qxF -- "$v" && return 0
   printf '%s\n' "$v" > "$work/needle"
-  g -iF -f "$work/needle" "$work/added" | report "value of $label from .env" || true
+  g -iF -f "$work/needle" "$work/added" | report "$kind" || true
 }
 for envfile in .env .env.*; do
   [[ -f $envfile && $envfile != .env.example ]] || continue
@@ -107,21 +108,30 @@ for envfile in .env .env.*; do
     k=${BASH_REMATCH[2]} v=${BASH_REMATCH[3]}
     v=${v%%[[:space:]]#*}; v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
     [[ -z $v ]] && continue
-    check_value "$k" "$v"
+    check_value "value of $k from .env" "$v"
     if [[ $v =~ ://([^/:@]+@)?([^/:]+) ]]; then
-      check_value "$k (host)" "${BASH_REMATCH[2]}"
+      check_value "value of $k (host) from .env" "${BASH_REMATCH[2]}"
     fi
     if [[ $v =~ ^([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})[:-]([0-9A-Fa-f]{2})$ ]]; then
       b=("${BASH_REMATCH[@]:1}")
-      check_value "$k" "$(IFS=:; echo "${b[*]}")"
-      check_value "$k" "$(IFS=-; echo "${b[*]}")"
-      check_value "$k (vendor prefix)" "${b[0]}:${b[1]}:${b[2]}"
-      check_value "$k (vendor prefix)" "${b[0]}-${b[1]}-${b[2]}"
-      check_value "$k (prefix)" "${b[0]}:${b[1]}:"
-      check_value "$k (prefix)" "${b[0]}-${b[1]}-"
+      check_value "value of $k from .env" "$(IFS=:; echo "${b[*]}")"
+      check_value "value of $k from .env" "$(IFS=-; echo "${b[*]}")"
+      check_value "value of $k (prefix) from .env" "${b[0]}:${b[1]}:"
+      check_value "value of $k (prefix) from .env" "${b[0]}-${b[1]}-"
     fi
   done < "$envfile"
 done
+
+# 2b. Private details that are not in .env (other hosts' IPs, your public IP,
+# subnet prefixes...): one per line in .git/info/private-values. That file
+# lives inside .git, so it is never committed or pushed.
+private_values=$(git rev-parse --git-path info/private-values)
+if [[ -f $private_values ]]; then
+  while IFS= read -r v || [[ -n $v ]]; do
+    [[ -z $v || $v == \#* ]] && continue
+    check_value "entry in .git/info/private-values" "$v"
+  done < "$private_values"
+fi
 
 # 3. Known credential formats.
 patterns=(

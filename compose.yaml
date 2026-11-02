@@ -1,5 +1,5 @@
 # OpenGate only — no database, no Ollama. Used as-is by Coolify and locally:
-#   docker compose up --build -d     (publishes on 127.0.0.1:8100 by default)
+#   docker compose up --build -d     (with OPENGATE_PUBLISH_ADDRESS=127.0.0.1 in .env)
 services:
   opengate:
     build: .
@@ -50,13 +50,13 @@ services:
     # Lets WOL_RELAY_ADDRESS=host.docker.internal:9009 reach the host-side relay.
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # Direct access without Coolify's proxy. Loopback-only unless
-    # OPENGATE_PUBLISH_ADDRESS is set (in Coolify: the server's LAN IP, to reach
-    # it from other machines). Never publish host port 8000 on the Coolify
-    # server: Coolify's own dashboard already listens there. The container
-    # itself always listens on 8000; that is the port Coolify's proxy targets.
+    # Where the host publishes OpenGate. Required, so a deployment without it
+    # fails visibly instead of silently binding somewhere unreachable: the
+    # Coolify server's LAN IP in Coolify, 127.0.0.1 for local testing. Never
+    # host port 8000 on the Coolify server: Coolify's dashboard listens there.
+    # The container itself always listens on 8000.
     ports:
-      - "${OPENGATE_PUBLISH_ADDRESS:-127.0.0.1}:${OPENGATE_PUBLISH_PORT:-8100}:8000"
+      - "${OPENGATE_PUBLISH_ADDRESS:?OPENGATE_PUBLISH_ADDRESS is required (LAN IP on Coolify, 127.0.0.1 locally)}:${OPENGATE_PUBLISH_PORT:-8100}:8000"
     expose:
       - "8000"
     healthcheck:
