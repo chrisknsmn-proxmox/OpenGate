@@ -1,2 +1,7 @@
 /target
 .env
+.env.*
+!.env.example
+*.swp
+*.swo
+*~
