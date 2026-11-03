@@ -1,6 +1,6 @@
 # OpenGate
 
-A small, authenticated, OpenAI-compatible gateway, **local first**. Every
+A small, authenticated, OpenAI-compatible gateway that is **local first**. Every
 request goes to one local Ollama model, waking the Windows PC with
 [Wake-on-LAN](#wake-on-lan) if it is asleep. Only if local inference is
 unavailable can OpenGate fall back to **your ChatGPT plan**, through the
