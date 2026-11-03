@@ -90,7 +90,7 @@ fn ollama_mock(counters: Counters) -> Router {
             }),
         )
         .route(
-            "/v1/chat/completions",
+            "/api/chat",
             post(
                 |State(c): State<Counters>, Json(body): Json<Value>| async move {
                     c.chats.fetch_add(1, Ordering::SeqCst);
@@ -101,23 +101,25 @@ fn ollama_mock(counters: Counters) -> Router {
         .with_state(counters)
 }
 
+/// Ollama's native `/api/chat` answer: NDJSON when streaming.
 fn chat_reply(stream: bool) -> Response {
+    let done = json!({
+        "model": "llama3.1:8b", "message": { "role": "assistant", "content": "" },
+        "done": true, "done_reason": "stop", "prompt_eval_count": 4, "eval_count": 2,
+    });
     if stream {
         let chunk = json!({
-            "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "llama3.1:8b",
-            "choices": [{ "index": 0, "delta": { "content": "Hello!" }, "finish_reason": null }],
+            "model": "llama3.1:8b", "message": { "role": "assistant", "content": "Hello!" }, "done": false,
         });
         return (
-            [("content-type", "text/event-stream")],
-            Body::from(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+            [("content-type", "application/x-ndjson")],
+            Body::from(format!("{chunk}\n{done}\n")),
         )
             .into_response();
     }
-    Json(json!({
-        "id": "c", "object": "chat.completion", "created": 1, "model": "llama3.1:8b",
-        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Hello!" }, "finish_reason": "stop" }],
-    }))
-    .into_response()
+    let mut answer = done;
+    answer["message"]["content"] = "Hello!".into();
+    Json(answer).into_response()
 }
 
 pub async fn pc(power: Power) -> Pc {

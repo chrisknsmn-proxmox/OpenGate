@@ -11,6 +11,7 @@ pub mod chatgpt;
 mod config;
 mod error;
 mod fallback;
+mod ollama;
 mod relay;
 mod upstream;
 mod validate;

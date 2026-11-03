@@ -152,6 +152,54 @@ impl ApiError {
         .local("ollama_unavailable")
     }
 
+    /// The prompt does not fit the local model's context window. Worded so
+    /// that clients which compact on overflow (OpenClaw) recognise it. A 4xx:
+    /// retrying the same request elsewhere is not a fix for its size.
+    pub fn context_length_exceeded(num_ctx: Option<u32>, detail: &str) -> Self {
+        let window = match num_ctx {
+            Some(n) => format!("the {n}-token context window"),
+            None => "the context window".to_owned(),
+        };
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
+            format!(
+                "input exceeds {window} of the local model; shorten or compact the \
+                 conversation, or raise OLLAMA_NUM_CTX if memory allows (Ollama: {detail})"
+            ),
+        )
+    }
+
+    /// The configured Ollama model cannot do tool calling at all.
+    pub fn local_tools_unsupported() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "tools_not_supported",
+            "the local model does not support tool calling; set OLLAMA_MODEL to a \
+             tools-capable model, or send the request without tools",
+        )
+    }
+
+    /// The model produced a tool call OpenGate cannot pass on faithfully
+    /// (no function name, arguments that are not a JSON object).
+    pub fn upstream_invalid_tool_call() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream_invalid_tool_call",
+            "the local model produced a malformed tool call",
+        )
+    }
+
+    /// The model's answer does not honour `tool_choice` or
+    /// `parallel_tool_calls: false`, which the local model cannot enforce.
+    pub fn tool_choice_not_satisfied(message: &'static str) -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "tool_choice_not_satisfied",
+            message,
+        )
+    }
+
     pub fn stream_incomplete() -> Self {
         Self::new(
             StatusCode::BAD_GATEWAY,

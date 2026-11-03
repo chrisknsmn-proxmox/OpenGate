@@ -54,19 +54,90 @@ The `model` field is always the virtual model, whichever provider answered.
 | Field | Notes |
 |---|---|
 | `model` | Must equal `OPENGATE_VIRTUAL_MODEL` (default `opengate/local`). Mapped to `OLLAMA_MODEL` internally; the real name is never accepted from or shown to clients. |
-| `messages` | Roles `system`, `developer` (sent as `system`), `user`, `assistant`. Content is a string or text parts (joined with newlines). Message `name` is accepted and dropped. |
+| `messages` | Roles `system`, `developer` (sent as `system`), `user`, `assistant`, `tool`. Content is a string or text parts (joined with newlines); assistant content may be `null` when it has `tool_calls`. Message `name` is accepted and dropped. An earlier answer's `reasoning_content`/`reasoning`/`refusal` is accepted and not forwarded. |
+| `tools` | Function tools: `name` (`[A-Za-z0-9_-]{1,64}`, unique), `description`, `parameters` (a JSON Schema object; missing = no parameters). At most 128. `strict: true` is rejected (neither provider can guarantee schema-exact arguments); `strict: false` is accepted. |
+| `tool_choice` | `auto` (default), `none` (tools are not sent to the model), `required`, or `{"type":"function","function":{"name":…}}`. See [Tool calling](#tool-calling). |
+| `parallel_tool_calls` | `true`/`false`. See [Tool calling](#tool-calling). |
+| assistant `tool_calls`, `tool` messages | Tool-call history: `{id, type:"function", function:{name, arguments}}` (arguments a JSON object as a string) and `{role:"tool", tool_call_id, content}`. Every tool call must be answered by a tool message with its ID before the next non-tool message, as OpenAI requires; IDs must be unique. |
 | `stream` | `true` for SSE. |
-| `stream_options` | Only `{"include_usage": bool}`. |
-| `temperature` (0–2), `top_p` (0–1), `presence_penalty`, `frequency_penalty` (−2–2), `seed`, `stop` (string or ≤4 strings) | Passed to Ollama. |
-| `max_tokens` / `max_completion_tokens` | Either one, sent to Ollama as `max_tokens`. |
+| `stream_options` | `{"include_usage": bool}` (`include_obfuscation` is accepted and ignored). |
+| `temperature` (0–2), `top_p` (0–1), `presence_penalty`, `frequency_penalty` (−2–2), `seed`, `stop` (string or ≤4 strings) | Passed to Ollama as `options`. |
+| `max_tokens` / `max_completion_tokens` | Either one, sent to Ollama as `options.num_predict`. |
+| `response_format` | `text` (no-op), `json_object` (Ollama `format: "json"`), `json_schema` (the schema as Ollama `format`). Not combinable with tools on Ollama (400). |
 | `n` | Only `1`. |
-| `user` | Accepted and dropped. |
-| `tools: []`, `tool_choice: "none"`, `parallel_tool_calls` | No-ops, accepted. |
+| `user`, `safety_identifier`, `prompt_cache_key`, `metadata`, `store: false` | Accepted and dropped: they identify or cache requests and cannot change the answer. `store: true` is rejected (OpenGate never stores). |
+| `functions` / `function_call` (deprecated) | Only `[]` / `"none"`; anything else is rejected — use `tools`. |
 
-Everything else is **rejected with 400**, naming the parameter. That covers
-non-empty `tools`, `tool` messages, `tool_calls`, images, `response_format`,
-`logprobs` and so on. Tool calling is not supported until it is proven against
-OpenClaw.
+Everything else is **rejected with 400**, naming the parameter: images,
+`logprobs`, `reasoning_effort`, `logit_bias`, `audio`, `modalities`, and so on.
+Nothing that could change the answer is silently dropped.
+
+### Tool calling
+
+OpenGate **never executes tools**. It passes tool definitions to the model,
+returns the model's tool calls to the client (OpenClaw runs them), and passes
+the tool results back on the next request.
+
+- **Responses.** A non-streaming answer has `message.tool_calls`
+  (`content: null` when there is no text) and `finish_reason: "tool_calls"`.
+  Arguments are always a JSON object serialized as a string. Several calls in
+  one answer are supported.
+- **IDs.** Ollama's own call ID is kept; when it does not send one, OpenGate
+  generates `call_<24 hex>`. An ID never changes within a response, and
+  history IDs are passed back to the model unchanged.
+- **`tool_choice` on Ollama.** Ollama has no `tool_choice`, so OpenGate
+  emulates it: `none` sends no tools; a forced function sends only that tool;
+  `required`, a forced function and `parallel_tool_calls: false` add one short
+  system instruction. The answer is then **checked**: a text-only answer to a
+  forced choice, a call to another tool, a call when none were offered, or a
+  second call with `parallel_tool_calls: false` is an error
+  (`tool_choice_not_satisfied`), never passed off as compliant.
+- **Malformed calls** (no function name, arguments that are not a JSON object)
+  are an error (`upstream_invalid_tool_call`), never repaired or invented.
+  A call to a tool name the request did not define is passed through as is;
+  OpenClaw answers it with a "tool not found" result the model can recover from.
+- **Models without tool support.** If `OLLAMA_MODEL` cannot do tool calling,
+  Ollama refuses and the client gets `400 tools_not_supported`. Small models
+  such as `llama3.1:8b` do support tools, but choose and fill them less
+  reliably than large hosted models; for heavy agent use, set `OLLAMA_MODEL`
+  to a stronger tools-capable model (no code change needed).
+
+### Context window
+
+OpenGate talks to Ollama's native `/api/chat` and sends `truncate: false` and
+`shift: false` with every request, so a prompt that does not fit is
+**refused** instead of having its history silently cut (which made an agent
+answer a different conversation than the one it sent). The client gets:
+
+```json
+{"error":{"code":"context_length_exceeded","type":"invalid_request_error","param":null,
+  "message":"input exceeds the 32768-token context window of the local model; shorten or compact the conversation, or raise OLLAMA_NUM_CTX if memory allows (Ollama: …)"}}
+```
+
+The wording matches OpenClaw's context-overflow detection, so OpenClaw can
+compact and retry. It is a 400: the same request would not fit any better a
+second time, and it never triggers the ChatGPT fallback.
+
+The window is whatever Ollama actually runs with, not the model's advertised
+maximum (llama3.1 advertises 128k):
+
+- Set **`OLLAMA_NUM_CTX`** (e.g. `32768`) and OpenGate sends it as
+  `options.num_ctx` with every request, independent of the PC's Ollama
+  settings. Unset, Ollama decides (`OLLAMA_CONTEXT_LENGTH` on the PC, the
+  Modelfile, or its default, which is small and varies by version and VRAM).
+- A larger window needs more memory for the KV cache: for `llama3.1:8b`
+  roughly 128 KiB per token at f16, so 32k tokens ≈ 4 GiB on top of the
+  ~5 GiB of weights. If it does not fit in VRAM, Ollama splits the model with
+  the CPU and gets much slower. Check after one request, on the PC:
+  `ollama ps` (columns `CONTEXT` and `PROCESSOR`, which should say `100% GPU`),
+  or remotely: `curl $B/health/providers` (`ollama.context_length` is what
+  Ollama allocated for the loaded model, `ollama.num_ctx` what OpenGate asks for).
+- Set OpenClaw's `contextWindow` to the **same** number. OpenClaw budgets its
+  prompt and `max_completion_tokens` from it; if it believes in more room than
+  Ollama has, requests fail with `context_length_exceeded`.
+- `truncate`/`shift` need a recent Ollama. An older one ignores them and
+  truncates silently as before; update Ollama on the PC if long conversations
+  seem to "forget" their beginning without any error.
 
 ### Errors
 
@@ -75,10 +146,14 @@ include prompt content.
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_json`, `invalid_request`, `unsupported_parameter`, `model_not_supported`, `tools_not_supported` | Caller error. OpenClaw treats 400 as terminal (no fallback). |
+| 400 | `invalid_json`, `invalid_request`, `unsupported_parameter`, `model_not_supported` | Caller error. OpenClaw treats 400 as terminal (no fallback). |
+| 400 | `context_length_exceeded` | The prompt does not fit the local model's context window (see [Context window](#context-window)). |
+| 400 | `tools_not_supported` | The request has tools but `OLLAMA_MODEL` cannot do tool calling. |
 | 401 | `invalid_api_key` | Missing or wrong key. |
 | 413 | `request_too_large` | Body over 4 MiB. |
 | 502 | `upstream_error`, `upstream_invalid_response` | Ollama returned an error or garbage. |
+| 502 | `upstream_invalid_tool_call` | The model produced a malformed tool call (no name, arguments not a JSON object). |
+| 502 | `tool_choice_not_satisfied` | The model's answer broke `tool_choice` or `parallel_tool_calls: false` (see [Tool calling](#tool-calling)). |
 | 503 | `upstream_unavailable` | Ollama unreachable (with WOL: still unreachable after the wake timeout, or a wake failed within the last `WOL_RETRY_COOLDOWN_SECONDS`). |
 | 503 | `upstream_model_unavailable` | Model not installed on Ollama. |
 | 503 | `upstream_overloaded` | Ollama said it is busy. |
@@ -119,19 +194,36 @@ both outcomes in `error.providers`:
 | `subscription_expired` | The refresh token expired (30 days unused). | `opengate chatgpt login` |
 | `subscription_limit_reached` | ChatGPT plan or app usage limit. Fallback pauses for `CHATGPT_LIMIT_PAUSE_SECONDS`. | Wait, or review limits at [chatgpt.com/settings/usage](https://chatgpt.com/settings/usage). |
 | `subscription_provider_unavailable` | OpenAI or the network is unavailable. Credentials are kept. | Retry later. |
-| `unsupported_request` | The request uses something the ChatGPT plan route cannot do, e.g. `temperature` or `max_tokens` (named in `param`). | See [Supported requests](#supported-requests-on-the-chatgpt-plan). |
+| `unsupported_request` | The request uses something the ChatGPT plan route cannot do, e.g. `temperature` or `max_tokens` (named in `param`), or the route refused a tool (`subscription_sharing_unsupported_capability`). | See [Supported requests](#supported-requests-on-the-chatgpt-plan). |
 
 ### Streaming
 
-Frames are relayed one at a time as they arrive (`data: {...}\n\n`), with
-`model` rewritten to the virtual id. `data: [DONE]` is sent **only** if Ollama
-sent it. If the stream fails after it has started (upstream error, idle timeout,
-overall timeout, or EOF without `[DONE]`), OpenGate sends one error frame,
-`data: {"error":{…}}`, and ends the stream **without** `[DONE]`. If the client
-disconnects, the upstream request is dropped and Ollama stops generating.
+Ollama's native stream is translated to standard `chat.completion.chunk`
+frames (`data: {...}\n\n`) as it arrives, all with one `id` and `model` set to
+the virtual id:
+
+1. `{"role":"assistant","content":""}`, sent as soon as Ollama accepts the request;
+2. text deltas (`content`), and `reasoning_content` for thinking models;
+3. per tool call, an opening delta `{"index":i,"id":…,"type":"function","function":{"name":…,"arguments":""}}`
+   then its arguments (`{"index":i,"function":{"arguments":"{…}"}}`).
+   Concatenating the argument fragments of an index gives the JSON object the
+   model produced. `index` counts from 0 within the response;
+4. one final chunk with an empty delta and `finish_reason` (`stop`,
+   `tool_calls` or `length`) — exactly one;
+5. with `stream_options.include_usage`, a usage chunk (`choices: []`,
+   `usage: {prompt_tokens, completion_tokens, total_tokens}` from Ollama's counts);
+6. `data: [DONE]`.
+
+`data: [DONE]` is sent **only** after Ollama's final chunk. If the stream fails
+after it has started (upstream error, context overflow, idle timeout, overall
+timeout, EOF before the end, malformed data, an answer that breaks
+`tool_choice`), OpenGate sends one error frame, `data: {"error":{…}}`, and ends
+the stream **without** `[DONE]`. If the client disconnects, the upstream request
+is dropped and Ollama stops generating.
 
 The same rules apply to a ChatGPT plan stream. OpenAI's events are translated
-to `chat.completion.chunk` frames, and `[DONE]` follows only
+to `chat.completion.chunk` frames (function calls become the same `tool_calls`
+deltas, with arguments streamed in OpenAI's fragments), and `[DONE]` follows only
 `response.completed` (or `response.incomplete`, sent with `finish_reason:
 "length"`). A usage limit or error mid-stream ends the stream with one error
 frame and no `[DONE]`. Once any output has been sent, OpenGate never retries
@@ -143,7 +235,8 @@ on another provider.
 |---|---|---|
 | `OPENGATE_API_KEY` | **required** | ≥32 chars, no whitespace. Generate with `openssl rand -base64 48 \| tr -d '\n=+/'`. |
 | `OLLAMA_BASE_URL` | **required** | e.g. `http://192.168.1.50:11434`. Plain http(s), no credentials or query. |
-| `OLLAMA_MODEL` | **required** | Installed Ollama model, e.g. `llama3.1:8b`. |
+| `OLLAMA_MODEL` | **required** | Installed Ollama model, e.g. `llama3.1:8b`. Change it (and redeploy) to use another model; no code change. For tool calling it must be a tools-capable model. |
+| `OLLAMA_NUM_CTX` | — (Ollama decides) | 512–1048576. Context window sent to Ollama with every request (`options.num_ctx`). See [Context window](#context-window). |
 | `OPENGATE_VIRTUAL_MODEL` | `opengate/local` | The only model id clients may send. |
 | `OPENGATE_HOST` | `0.0.0.0` | Listen address. |
 | `OPENGATE_PORT` | `8000` | Listen port. |
@@ -173,6 +266,7 @@ on another provider.
 | `CHATGPT_STREAM_IDLE_TIMEOUT_SECONDS` | `120` | Max gap between ChatGPT stream events. |
 | `CHATGPT_LIMIT_PAUSE_SECONDS` | `300` | After a usage-limit error, fallback requests fail fast for this long without calling OpenAI. |
 | `CHATGPT_DROP_UNSUPPORTED_SAMPLING` | `false` | `true` drops `temperature`, `top_p`, `seed` and the penalties on fallback instead of rejecting the request. |
+| `CHATGPT_DROP_MAX_TOKENS` | `false` | `true` drops `max_tokens`/`max_completion_tokens` on fallback instead of rejecting the request (the route has no output limit, so the answer may be longer). Needed for OpenClaw, which always sends a limit. |
 | `OPENAI_API_BILLING_ENABLED` | `false` | Must be `false`. `true` makes OpenGate refuse to start. `OPENAI_API_KEY` is never read; if it is set, OpenGate logs a warning. |
 
 The process refuses to start if a required value is missing or invalid. Error
@@ -393,17 +487,21 @@ in-process token refresh with no restarts, and a small image.
 
 ### Supported requests on the ChatGPT plan
 
-OpenGate's normal validation applies first: tools, images, `response_format`
-and similar are already rejected for every provider. On fallback:
+OpenGate's normal validation applies first: images, `logprobs` and similar are
+already rejected for every provider. On fallback:
 
 | Request feature | On the ChatGPT plan |
 |---|---|
 | `messages` (system, developer, user, assistant; text) | Supported. System prompts are sent as `developer` messages, since this route rejects system items. The full history is sent on every request (`store: false`, no `previous_response_id`). |
 | `stream: true` / `false` | Supported. OpenAI always streams; for `stream: false`, OpenGate collects the stream and returns one `chat.completion`. Partial text is never returned as a success. |
 | `stream_options.include_usage` | Supported (`input_tokens`/`output_tokens` mapped to `prompt_tokens`/`completion_tokens`). |
-| `n: 1`, `user`, `tools: []`, `tool_choice: "none"`, `parallel_tool_calls` | Accepted no-ops, as for Ollama. |
+| `tools`, `tool_choice`, `parallel_tool_calls` | Sent as Responses function tools, grouped in one namespace (`opengate`) as the Sign in with ChatGPT docs require for this route, with `strict: false`. `tool_choice` maps to `auto`/`none`/`required`/`{"type":"function","name":…}`. Function calls come back as `tool_calls` (IDs are OpenAI's `call_…`), `finish_reason: "tool_calls"`. **Not yet verified against the live route** (only against a mock): if the plan route refuses a tool request, the client gets `unsupported_request`, never a fake success. |
+| Tool history (assistant `tool_calls`, `tool` messages) | Sent as `function_call` / `function_call_output` input items with the client's call IDs, so a conversation started on Ollama continues here. Nothing has been sent to the client before the switch, so no tool call is duplicated. |
+| `response_format` | Sent as `text.format` (`json_object` or `json_schema`). |
+| `n: 1`, `user`, `prompt_cache_key`, `store: false` | Accepted no-ops, as for Ollama. |
 | `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `seed` | **Rejected** with `unsupported_request` (this route does not accept them), unless `CHATGPT_DROP_UNSUPPORTED_SAMPLING=true`, which drops them. |
-| `max_tokens` / `max_completion_tokens`, `stop` | **Always rejected** on fallback. The route has no `max_output_tokens` and no stop sequences, and dropping them would silently change the output. |
+| `max_tokens` / `max_completion_tokens` | **Rejected** on fallback: the route has no `max_output_tokens`, and dropping the limit would silently change the output — unless you opt in with `CHATGPT_DROP_MAX_TOKENS=true`. |
+| `stop` | **Always rejected** on fallback (no stop sequences on this route). |
 | Response `id` | OpenAI's response ID (`resp_…`), preserved. |
 | `model` in responses | Always the virtual model (`opengate/local`). The `x-opengate-provider` header says who answered. |
 | `finish_reason` | `stop` (`response.completed`), `length`/`content_filter` (`response.incomplete`). Failures are errors, never a finish reason. |
@@ -551,12 +649,15 @@ ChatGPT Settings yourself.
 
 ```json
 {"gateway":{"status":"ok"},
- "ollama":{"status":"ready","wake_on_lan":true},
+ "ollama":{"status":"ready","wake_on_lan":true,"num_ctx":32768,"context_length":32768},
  "chatgpt":{"status":"authorized","fallback_enabled":true}}
 ```
 
 - **`ollama`** is `ready`, `upstream_unreachable`, `upstream_timeout`,
   `model_not_installed` or `upstream_error`. The probe never wakes the PC.
+  `num_ctx` is `OLLAMA_NUM_CTX` (null if unset); `context_length` is what
+  Ollama allocated for the model if it is loaded right now (from `/api/ps`;
+  null when unloaded or unreachable).
 - **`chatgpt`** is `disabled`, `authorized`, `subscription_not_configured`,
   `subscription_not_authorized`, `subscription_expired`,
   `subscription_limit_reached` (while paused) or
@@ -669,7 +770,8 @@ docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/app -w /app \
   rust:1.92-slim-trixie cargo test
 ```
 
-The tests (`cargo test`) run a real OpenGate against a mock Ollama. They cover
+The tests (`cargo test`) run a real OpenGate against a mock of Ollama's native
+API (`/api/chat`, NDJSON streams). `tests/gateway.rs` covers
 auth, validation, nonstreaming, streaming (frames split across reads, single
 `[DONE]`, incremental delivery), upstream down, missing model, upstream 500,
 connect/overall/idle timeouts, failed streams never ending in `[DONE]`, the
@@ -715,6 +817,38 @@ mock receives. It covers:
 - the cloud being down while local keeps working
 - Ollama 4xx and mid-stream failures never falling back
 - credentials written by `login` picked up without a restart
+
+`tests/openclaw.rs` sends the exact request shapes OpenClaw 2026.10.5's
+`openai-completions` transport sends to a custom endpoint, through a real
+OpenGate in front of a scripted mock of Ollama's native API, and checks what
+reaches Ollama as well as what the client gets. It covers:
+- a streamed agent turn with two tool calls: role chunk, opening deltas,
+  argument reconstruction into valid JSON, kept and generated IDs, one
+  `tool_calls` finish, one `[DONE]`; `truncate:false`, `num_ctx`, `num_predict`
+- streamed text with the usage chunk; `length` finishes
+- a non-streaming tool call (`content: null`, string arguments)
+- tool results passed back (`tool_name`, `tool_call_id`) and a final answer,
+  then a third multi-turn round
+- out-of-order tool results rejected before Ollama is called
+- forced `tool_choice` (only that tool sent; ignoring it is an error, streaming
+  and not) and `tool_choice: "none"`
+- malformed tool arguments and malformed stream lines from the model
+- context overflow as a 400 (HTTP and mid-stream), and never falling back
+- a model without tool support; Ollama unavailable with tools
+- unsupported fields rejected before calling Ollama; harmless ones accepted
+- auth required for tool requests; `/health/providers` context reporting
+- ChatGPT plan fallback with tools: streamed and collected function calls,
+  namespaced tool definitions, tool history as `function_call` items sent
+  once, `max_tokens` refused unless `CHATGPT_DROP_MAX_TOKENS=true`
+
+`tests/smoke.rs` holds optional smoke tests against a **real** deployment
+(chat, stream, a tool round trip). They are `#[ignore]`d, need no credentials
+in CI, and run only on request; they spend real inference and may wake the PC:
+
+```bash
+OPENGATE_SMOKE_BASE_URL=http://<VM-104-LAN-IP>:8100 OPENGATE_SMOKE_API_KEY="$OPENGATE_API_KEY" \
+  cargo test --test smoke -- --ignored --test-threads=1 --nocapture
+```
 
 `tests/chatgpt_login.rs` runs the sign-in flow against the mock authorization
 server: dynamic registration, PKCE, ID-token signature, issuer, audience and
@@ -799,6 +933,34 @@ curl -N $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"opengate/local","messages":[{"role":"user","content":"Count to three."}],"stream":true}'
 
+# Tool calling: expect finish_reason "tool_calls" and message.tool_calls
+curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
+  -H 'Content-Type: application/json' -d '{"model":"opengate/local",
+  "messages":[{"role":"user","content":"What is the weather in Paris? Use the tool."}],
+  "tools":[{"type":"function","function":{"name":"get_weather","description":"Current weather for a city",
+    "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+  "tool_choice":"auto"}'
+
+# Streaming tool call: expect tool_calls deltas, one finish_reason, then [DONE]
+curl -N $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
+  -H 'Content-Type: application/json' -d '{"model":"opengate/local","stream":true,
+  "stream_options":{"include_usage":true},
+  "messages":[{"role":"user","content":"What is the weather in Paris? Use the tool."}],
+  "tools":[{"type":"function","function":{"name":"get_weather",
+    "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}'
+
+# Tool result round trip: the client (you) answers the call
+curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
+  -H 'Content-Type: application/json' -d '{"model":"opengate/local","messages":[
+  {"role":"user","content":"What is the weather in Paris?"},
+  {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function",
+    "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+  {"role":"tool","tool_call_id":"call_1","content":"18C and sunny"}],
+  "tools":[{"type":"function","function":{"name":"get_weather",
+    "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'
+
+curl -sS $B/health/providers     # ollama.context_length: the real window, once the model is loaded
+
 # Expected failures
 curl -i $B/v1/models                                              # 401
 curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
@@ -843,6 +1005,13 @@ curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
    CHATGPT_CREDENTIALS_KEY=<secret>
    CHATGPT_MODEL=auto
    ```
+   For OpenClaw (see [Using OpenGate from OpenClaw](#using-opengate-from-openclaw)),
+   also set:
+
+   ```
+   OLLAMA_NUM_CTX=32768
+   CHATGPT_DROP_MAX_TOKENS=true    # only if OpenClaw turns should use the fallback
+   ```
    `compose.yaml` mounts the named volume `opengate-data` at `/data`, where the
    encrypted credentials live. Coolify keeps named volumes across restarts and
    redeploys. Check that it appears under the resource's **Storages**, and never
@@ -875,6 +1044,9 @@ curl -sS $B/v1/chat/completions -H "Authorization: Bearer $OPENGATE_API_KEY" \
    - `/health/ready` returns 200. This proves the container can reach Ollama.
    - `/v1/models` returns 401 without the key and 200 with it.
    - A streaming request arrives incrementally and ends in `[DONE]`.
+   - A tool request returns `finish_reason: "tool_calls"` (see
+     [Smoke tests](#smoke-tests)), and `/health/providers` shows
+     `ollama.context_length` equal to `OLLAMA_NUM_CTX` after it.
    - Logs show one line per request and no prompt text.
    - The OpenGate startup log shows `wol: Some(WolConfig { … target: Relay("host.docker.internal:9009") … })`.
      If it shows `wol: None`, a value is missing; look for the WOL warning.
@@ -1097,69 +1269,141 @@ rule, add a GitHub repository webhook with a long random secret (Coolify →
 **Webhooks → Manual Git webhooks → GitHub**), and set **Auto deploy** to
 **Deploy on push (webhooks)**. Never forward the dashboard or OpenGate's port.
 
-## Using OpenGate from OpenClaw (optional)
+## Using OpenGate from OpenClaw
 
-OpenClaw is **not required**: OpenGate now does the ChatGPT plan fallback
-itself, so any OpenAI-compatible client gets it. If you use OpenClaw as a
-client, verify each step against the **installed** OpenClaw release; these are
-not drop-in values.
+OpenGate works as an OpenClaw **custom provider** with `api:
+"openai-completions"`, including agent turns with tools, streaming and
+multi-turn tool conversations. The behaviour below was checked against the
+request builder of OpenClaw **2026.10.5** (`@openclaw/ai`), which treats a LAN
+URL such as `http://<VM-104-LAN-IP>:8100/v1` as a *custom, proxy-like* endpoint:
+it sends `tools` with an explicit `tool_choice: "auto"`, `max_completion_tokens`
+(clamped to `contextWindow` minus its own input estimate), assistant messages
+with `content: null` + `tool_calls`, and `tool` messages. It does **not** send
+`store`, `stream_options`, `prompt_cache_key` or `reasoning_effort` to such an
+endpoint unless a `compat` flag asks for them.
 
-1. **Add OpenGate as a custom provider** ([custom providers](https://docs.openclaw.ai/gateway/config-tools/custom-providers)).
-   This is a sketch to check against the installed schema (`apiKey` SecretRef
-   syntax in particular):
+**Why it used to fail with HTTP 400:** OpenGate rejected exactly those fields:
+non-empty `tools` and `tool_choice: "auto"` (`tools_not_supported`), and in
+later turns `tool_calls`, `content: null` and `role: "tool"`. All are now
+supported.
 
-   ```json5
-   {
-     models: {
-       providers: {
-         opengate: {
-           baseUrl: "https://opengate.<your-domain>/v1",
-           apiKey: "<SecretRef/env reference to OPENGATE_API_KEY>",
-           api: "openai-completions",
-           models: [{
-             id: "opengate/local",
-             name: "OpenGate local (llama3.1:8b)",
-             input: ["text"],
-             contextWindow: 32768,      // must match Ollama's real context length, see below
-             maxTokens: 4096,
-             compat: {
-               supportsTools: false,         // OpenGate rejects tools; otherwise every agent turn is a terminal 400
-               requiresStringContent: true,
-               strictMessageKeys: true,      // OpenGate accepts only role/content/name
-             },
-           }],
-         },
-       },
-     },
-     agents: {
-       defaults: {
-         model: {
-           primary: "opengate/opengate/local",   // confirm with `openclaw models list`
-           // No `fallbacks` needed: OpenGate falls back to your ChatGPT plan itself.
-         },
-       },
-     },
-   }
-   ```
+### OpenClaw configuration
 
-   If the doubled `opengate/opengate/local` causes trouble, set
-   `OPENGATE_VIRTUAL_MODEL=local` and use model id `local`, so the ref becomes `opengate/local`.
+Verify against the installed release; key names below are from the 2026.10.5
+config schema.
 
-2. **Context length.** Ollama's OpenAI endpoint cannot set `num_ctx` per
-   request and silently truncates long prompts. OpenClaw agent prompts are
-   large. On the Windows host, set `OLLAMA_CONTEXT_LENGTH` (e.g. `32768`, as
-   VRAM allows), restart Ollama, and set the same value as `contextWindow`.
+```json5
+{
+  models: {
+    providers: {
+      opengate: {
+        baseUrl: "http://<VM-104-LAN-IP>:8100/v1",
+        apiKey: "<SecretRef/env reference to OPENGATE_API_KEY>",
+        api: "openai-completions",
+        models: [{
+          id: "opengate/local",            // = OPENGATE_VIRTUAL_MODEL
+          name: "OpenGate local (llama3.1:8b)",
+          input: ["text"],                 // OpenGate accepts text only
+          reasoning: false,
+          contextWindow: 32768,            // = OLLAMA_NUM_CTX, see "Context window"
+          maxTokens: 4096,
+          compat: {
+            supportsTools: true,           // was false; tools now work
+            strictMessageKeys: false,      // MUST be false: true strips tool_calls and tool_call_id
+            requiresStringContent: true,   // optional; OpenGate accepts text parts too
+            supportsUsageInStreaming: true,// OpenGate sends the usage chunk; gives OpenClaw real token counts
+            supportsStrictMode: false,     // strict:true tools are refused by OpenGate
+          },
+        }],
+      },
+      // Your direct OpenAI provider stays as it is, a separate provider:
+      // OpenGate neither replaces nor touches it.
+    },
+  },
+  agents: {
+    defaults: {
+      model: {
+        primary: "opengate/opengate/local",   // confirm with `openclaw models list`
+      },
+    },
+  },
+}
+```
 
-3. **Fallback.** Leave OpenClaw's own fallback out, or two layers will each
-   try to recover from the same failure. OpenGate's fallback rejects
-   `temperature`, `top_p` and `max_tokens` by default. If OpenClaw always sends
-   them, either configure the model without them, or set
-   `CHATGPT_DROP_UNSUPPORTED_SAMPLING=true` (this drops the sampling hints
-   only; `max_tokens` is still rejected).
+If the doubled `opengate/opengate/local` causes trouble, set
+`OPENGATE_VIRTUAL_MODEL=local` and use model id `local`, so the ref becomes
+`opengate/local`.
+
+On the OpenGate side (Coolify environment), for OpenClaw:
+
+```dotenv
+OLLAMA_NUM_CTX=32768            # same as contextWindow; only as high as the PC's memory allows
+CHATGPT_DROP_MAX_TOKENS=true    # only if you want OpenClaw turns to use the ChatGPT plan fallback
+```
+
+- **Context.** A fresh OpenClaw agent session already sends ~15k tokens of
+  system prompt and tool definitions, so an 8k window overflows on the first
+  message. Use 32768 (or more, if `ollama ps` still shows `100% GPU`). See
+  [Context window](#context-window).
+- **Fallback.** Leave OpenClaw's own fallback to OpenGate out of this
+  provider, or two layers will each try to recover from the same failure.
+  OpenGate's fallback rejects `max_tokens` by default and OpenClaw always sends
+  `max_completion_tokens`, so without `CHATGPT_DROP_MAX_TOKENS=true` an OpenClaw
+  turn that reaches the fallback fails with `all_providers_unavailable`
+  (`unsupported_request`, `param: max_tokens`). OpenClaw sends `temperature`
+  only when configured; if it does, also set
+  `CHATGPT_DROP_UNSUPPORTED_SAMPLING=true`.
+
+### Limitations
+
+- `llama3.1:8b` does tool calling, but a small model picks and fills tools
+  less reliably than a large hosted one, and may answer in text where a tool
+  was needed. For heavier agent work, point `OLLAMA_MODEL` at a stronger
+  tools-capable model.
+- `tool_choice` and `parallel_tool_calls: false` are emulated on Ollama and
+  **checked**; an answer that breaks them is an error, not a silent pass.
+- Text only: images in messages and tool results are rejected (`input:
+  ["text"]` keeps OpenClaw from sending them).
+- ChatGPT plan tool calls follow the Sign in with ChatGPT documentation
+  (namespaced function tools) but have only been tested against a mock. Run
+  `opengate chatgpt test` and one tool request with Ollama off before relying
+  on it; a refusal surfaces as `unsupported_request`.
+- Prior reasoning (`reasoning_content`) in the history is not forwarded.
+
+### Verify end to end (manual)
+
+The automated tests prove the protocol against mocks. These checks need the
+real OpenClaw UI, PC and Ollama, so run them after each deployment:
+
+1. `openclaw models list` shows the OpenGate model; select it for a new chat.
+2. Send "Hi" in a new session: an answer streams in (no immediate context
+   error). `curl $B/health/providers` then shows `ollama.context_length` equal
+   to `OLLAMA_NUM_CTX`.
+3. Ask something that needs a tool, e.g. "List the files in your workspace".
+   OpenClaw shows the tool call, runs it, and the final answer uses its result.
+   OpenGate's log shows two `POST /v1/chat/completions status=200` lines.
+4. Ask a follow-up in the same session (multi-turn with tool history).
+5. Switch the chat to the direct OpenAI provider and back: both work.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `400` `context_length_exceeded` | The conversation does not fit the window Ollama runs with. Raise `OLLAMA_NUM_CTX` (and `contextWindow`) if memory allows, or let OpenClaw compact. |
+| OpenClaw: "Context window exceeded: estimated input … leaves only 0 output tokens" | OpenClaw's own pre-check: `contextWindow` is too small for its prompt. Raise `contextWindow` (and `OLLAMA_NUM_CTX` to match). |
+| `400` with `param` naming a field | OpenClaw sent something OpenGate cannot honour; the message says what. With `strictMessageKeys: true`, tool results lose `tool_call_id` and fail ordering checks — set it to `false`. |
+| `400` `tools_not_supported` | `OLLAMA_MODEL` has no tool support. Pick a tools-capable model. |
+| `502` `tool_choice_not_satisfied` / `upstream_invalid_tool_call` | The local model did not follow the tool request or produced broken arguments. Retry, or use a stronger model. |
+| Tools never called, model "describes" calls in text | The model is too weak for the toolset, or `supportsTools` is `false` in OpenClaw. |
+| Answers slow after raising the context | The model no longer fits in VRAM: `ollama ps` shows a CPU share. Lower `OLLAMA_NUM_CTX`. |
+| Long chats "forget" their start, no error | Ollama is too old to honour `truncate: false`; update it on the PC. |
+| `503` `all_providers_unavailable`, `chatgpt: unsupported_request`, `param: max_tokens` | Fallback refused OpenClaw's output limit; set `CHATGPT_DROP_MAX_TOKENS=true`. |
 
 ## Out of scope
 
 No tev1 or other routing model, no complexity scoring or prompt-based
 escalation. No OpenAI API keys, Platform credits or API billing. No Codex
 app-server, browser cookies, scraped ChatGPT endpoints or copied Codex `auth.json`.
-No database, no dashboard, one local model only.
+No database, no dashboard, one local model only. OpenGate never executes
+tools: it only carries tool definitions, calls and results between the client
+and the model.

@@ -24,6 +24,7 @@ use crate::{
     config::Config,
     error::ApiError,
     fallback::{self, Providers, Routed},
+    ollama::Reply,
     relay::relay,
     upstream::Ollama,
     validate,
@@ -120,16 +121,32 @@ async fn ready(State(s): State<Arc<AppState>>) -> Response {
 /// Gateway, Ollama and ChatGPT plan status, separately. Always 200: this is
 /// for dashboards and troubleshooting, not a liveness signal. Neither check
 /// wakes the PC or spends plan usage; values are coarse status codes only.
+/// `context_length` is what Ollama actually allocated for the loaded model
+/// (null when it is not loaded); `num_ctx` is what OpenGate requests.
 async fn providers(State(s): State<Arc<AppState>>) -> Json<Value> {
-    let (ollama, chatgpt) = tokio::join!(s.ollama.probe(), async {
-        match &s.chatgpt {
-            Some(c) => c.health().await,
-            None => "disabled",
+    let (ollama, chatgpt) = tokio::join!(
+        async {
+            let status = s.ollama.probe().await;
+            let ctx = match status {
+                Ok(()) => s.ollama.loaded_context_length().await,
+                Err(_) => None,
+            };
+            (status, ctx)
+        },
+        async {
+            match &s.chatgpt {
+                Some(c) => c.health().await,
+                None => "disabled",
+            }
         }
-    });
+    );
+    let (ollama, context_length) = ollama;
     Json(json!({
         "gateway": { "status": "ok" },
-        "ollama": { "status": ollama.err().unwrap_or("ready"), "wake_on_lan": s.wol.is_some() },
+        "ollama": {
+            "status": ollama.err().unwrap_or("ready"), "wake_on_lan": s.wol.is_some(),
+            "num_ctx": s.ollama.num_ctx(), "context_length": context_length,
+        },
         "chatgpt": { "status": chatgpt, "fallback_enabled": s.chatgpt.is_some() },
     }))
 }
@@ -151,7 +168,7 @@ async fn chat(
     })?;
     let req = validate::chat_request(req, &s.config.virtual_model)?;
     if s.config.log_prompt_content {
-        info!(messages = %req.messages(), "prompt content");
+        info!(messages = %req.messages_for_log(), "prompt content");
     }
 
     // No queue: a local GPU serves a couple of requests at once, and a fast,
@@ -171,16 +188,21 @@ async fn chat(
     let vm = s.config.virtual_model.clone();
 
     let res = match fallback::route(providers, &req).await? {
-        Routed::Local(res) if stream => {
-            let frames = relay(res, vm, s.config.stream_idle_timeout, permit);
-            sse(Body::from_stream(frames), "ollama")
-        }
         Routed::Local(res) => {
-            let mut completion: Value = res.json().await.map_err(crate::upstream::from_reqwest)?;
-            if !completion["choices"].is_array() {
-                return Err(ApiError::upstream_invalid_response());
+            let reply = Reply::new(&req, vm, s.ollama.num_ctx());
+            if stream {
+                let frames = relay(
+                    res,
+                    reply,
+                    req.include_usage,
+                    s.config.stream_idle_timeout,
+                    permit,
+                );
+                return Ok(sse(Body::from_stream(frames), "ollama"));
             }
-            completion["model"] = vm.into();
+            let mut reply = reply;
+            let body: Value = res.json().await.map_err(crate::upstream::from_reqwest)?;
+            let completion = reply.completion(&body)?;
             drop(permit);
             with_provider(Json(completion).into_response(), "ollama")
         }

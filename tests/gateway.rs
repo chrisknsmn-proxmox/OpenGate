@@ -85,21 +85,32 @@ async fn dead_port() -> SocketAddr {
 
 // ---- mock Ollama ---------------------------------------------------------
 
+/// Ollama's native non-streaming `/api/chat` answer.
 fn completion(model: &str) -> Value {
     json!({
-        "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": model,
-        "system_fingerprint": "fp_ollama",
-        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Hello!" }, "finish_reason": "stop" }],
-        "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
+        "model": model, "created_at": "2026-11-03T10:00:00Z",
+        "message": { "role": "assistant", "content": "Hello!" },
+        "done": true, "done_reason": "stop", "prompt_eval_count": 5, "eval_count": 2,
     })
 }
 
+/// One line of Ollama's native stream.
 fn chunk(content: &str) -> String {
     let c = json!({
-        "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1, "model": "llama3.1:8b",
-        "choices": [{ "index": 0, "delta": { "role": "assistant", "content": content }, "finish_reason": null }],
+        "model": "llama3.1:8b", "created_at": "2026-11-03T10:00:00Z",
+        "message": { "role": "assistant", "content": content }, "done": false,
     });
-    format!("data: {c}\n\n")
+    format!("{c}\n")
+}
+
+/// The final line of Ollama's native stream.
+fn done() -> String {
+    let c = json!({
+        "model": "llama3.1:8b", "created_at": "2026-11-03T10:00:00Z",
+        "message": { "role": "assistant", "content": "" },
+        "done": true, "done_reason": "stop", "prompt_eval_count": 5, "eval_count": 3,
+    });
+    format!("{c}\n")
 }
 
 /// Mock that echoes a completion and records the body it received.
@@ -107,7 +118,7 @@ async fn recording_mock() -> (SocketAddr, Arc<Mutex<Option<Value>>>) {
     let seen = Arc::new(Mutex::new(None));
     let router = Router::new()
         .route(
-            "/v1/chat/completions",
+            "/api/chat",
             post(|State(seen): State<Arc<Mutex<Option<Value>>>>, Json(body): Json<Value>| async move {
                 let model = body["model"].as_str().unwrap_or_default().to_owned();
                 *seen.lock().unwrap() = Some(body);
@@ -121,7 +132,7 @@ async fn recording_mock() -> (SocketAddr, Arc<Mutex<Option<Value>>>) {
 /// Mock whose chat endpoint streams `parts` verbatim, sleeping `gap` before each.
 async fn streaming_mock(parts: Vec<String>, gap: Duration) -> SocketAddr {
     let router = Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(move || {
             let parts = parts.clone();
             async move {
@@ -131,7 +142,7 @@ async fn streaming_mock(parts: Vec<String>, gap: Duration) -> SocketAddr {
                     Some((Ok::<_, std::io::Error>(Bytes::from(part)), it))
                 });
                 (
-                    [("content-type", "text/event-stream")],
+                    [("content-type", "application/x-ndjson")],
                     Body::from_stream(body),
                 )
             }
@@ -151,7 +162,7 @@ async fn endless_mock() -> (SocketAddr, Arc<AtomicBool>) {
     let hung_up = Arc::new(AtomicBool::new(false));
     let flag = hung_up.clone();
     let router = Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(move || {
             let guard = Hangup(flag.clone());
             async move {
@@ -304,8 +315,8 @@ async fn rejects_bad_requests_before_calling_upstream() {
             "model_not_supported",
         ),
         (
-            json!({ "model": VM, "messages": msgs, "tools": tools }),
-            "tools_not_supported",
+            json!({ "model": VM, "messages": msgs, "tools": tools, "tool_choice": "sometimes" }),
+            "invalid_request",
         ),
         (
             json!({ "model": VM, "messages": msgs, "logprobs": true }),
@@ -365,7 +376,9 @@ async fn nonstreaming_success() {
     let sent = seen.lock().unwrap().clone().unwrap();
     assert_eq!(sent["model"], "llama3.1:8b");
     assert_eq!(sent["stream"], false);
-    assert_eq!(sent["max_tokens"], 32);
+    assert_eq!(sent["options"]["num_predict"], 32);
+    assert_eq!(sent["truncate"], false, "never silently truncate history");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
 }
 
 #[tokio::test]
@@ -379,7 +392,7 @@ async fn upstream_unreachable_is_503() {
 #[tokio::test]
 async fn upstream_missing_model_is_503() {
     let router = Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(|| async {
             (axum::http::StatusCode::NOT_FOUND, Json(json!({ "error": { "message": "model \"llama3.1:8b\" not found, try pulling it first" } })))
         }),
@@ -393,7 +406,7 @@ async fn upstream_missing_model_is_503() {
 #[tokio::test]
 async fn upstream_server_error_is_502() {
     let router = Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(|| async {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -415,7 +428,7 @@ async fn upstream_server_error_is_502() {
 #[tokio::test]
 async fn upstream_timeout_is_504() {
     let router = Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(|| async {
             tokio::time::sleep(Duration::from_secs(5)).await;
             Json(completion("llama3.1:8b"))
@@ -453,7 +466,7 @@ async fn streaming_success() {
         a.into(),
         b.into(),
         chunk(", two") + &chunk(", three."),
-        "data: [DONE]\n\n".into(),
+        done(),
     ];
     let gw = gateway(
         streaming_mock(parts, Duration::from_millis(20)).await,
@@ -469,23 +482,44 @@ async fn streaming_success() {
 
     assert_eq!(frames.last(), Some(&"[DONE]"));
     assert_eq!(frames.iter().filter(|f| **f == "[DONE]").count(), 1);
-    let text: String = frames[..frames.len() - 1]
+    let chunks: Vec<Value> = frames[..frames.len() - 1]
         .iter()
-        .map(|f| {
-            let v: Value = serde_json::from_str(f).unwrap();
-            assert_eq!(v["model"], VM);
-            v["choices"][0]["delta"]["content"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        })
+        .map(|f| serde_json::from_str(f).unwrap())
+        .collect();
+    let id = chunks[0]["id"].as_str().unwrap();
+    assert!(id.starts_with("chatcmpl-"));
+    for c in &chunks {
+        assert_eq!(c["model"], VM);
+        assert_eq!(c["object"], "chat.completion.chunk");
+        assert_eq!(c["id"], id, "one ID for the whole stream");
+    }
+    assert_eq!(
+        chunks[0]["choices"][0]["delta"],
+        json!({ "role": "assistant", "content": "" })
+    );
+    let text: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
         .collect();
     assert_eq!(text, "One, two, three.");
+    let finishes: Vec<_> = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["finish_reason"].as_str())
+        .collect();
+    assert_eq!(
+        finishes,
+        ["stop"],
+        "exactly one finish event, on the last chunk"
+    );
+    assert!(
+        chunks.iter().all(|c| c.get("usage").is_none()),
+        "usage not requested"
+    );
 }
 
 #[tokio::test]
 async fn streaming_is_incremental() {
-    let parts = vec![chunk("first"), chunk("second"), "data: [DONE]\n\n".into()];
+    let parts = vec![chunk("first"), chunk("second"), done()];
     let gw = gateway(
         streaming_mock(parts, Duration::from_millis(400)).await,
         |_| {},
@@ -493,8 +527,14 @@ async fn streaming_is_incremental() {
     .await;
     let mut res = gw.chat(hello(true)).await;
     let start = std::time::Instant::now();
-    let first = res.chunk().await.unwrap().unwrap();
-    assert!(String::from_utf8_lossy(&first).contains("first"));
+    // The assistant role frame is sent at once, before any model output.
+    let role = res.chunk().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&role).contains("\"role\":\"assistant\""));
+    let mut seen = String::new();
+    while !seen.contains("first") {
+        seen += &String::from_utf8_lossy(&res.chunk().await.unwrap().unwrap());
+    }
+    assert!(!seen.contains("second"), "frames are not batched");
     assert!(
         start.elapsed() < Duration::from_millis(700),
         "first frame must not wait for the whole response"
@@ -523,17 +563,14 @@ async fn stream_ending_without_done_is_an_error() {
 
 #[tokio::test]
 async fn stream_upstream_error_frame_is_an_error() {
-    let parts = vec![
-        chunk("partial"),
-        "data: {\"error\":{\"message\":\"boom\"}}\n\n".into(),
-    ];
+    let parts = vec![chunk("partial"), "{\"error\":\"boom\"}\n".into()];
     let gw = gateway(streaming_mock(parts, Duration::ZERO).await, |_| {}).await;
     assert_failed_stream(gw.chat(hello(true)).await, "upstream_error").await;
 }
 
 #[tokio::test]
 async fn stream_idle_timeout() {
-    let parts = vec![chunk("one"), chunk("late"), "data: [DONE]\n\n".into()];
+    let parts = vec![chunk("one"), chunk("late"), done()];
     let gw = gateway(
         streaming_mock(parts, Duration::from_millis(600)).await,
         |c| c.stream_idle_timeout = Duration::from_millis(200),
@@ -554,7 +591,7 @@ async fn stream_overall_timeout() {
 #[tokio::test]
 async fn concurrency_limit_rejects_then_recovers() {
     let router = Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(|| async {
             tokio::time::sleep(Duration::from_millis(500)).await;
             Json(completion("llama3.1:8b"))

@@ -13,6 +13,10 @@
 //! 4. If the fallback fails too, the client gets one error naming both
 //!    outcomes (`all_providers_unavailable`, or `subscription_limit_reached`).
 //!
+//! 5. Fallback carries the whole conversation, tool calls and tool results
+//!    included, to the ChatGPT plan. Nothing has reached the client before the
+//!    switch, so no tool call is ever announced twice.
+//!
 //! With the fallback disabled, behaviour and error codes are unchanged.
 
 use tracing::{info, warn};
@@ -20,6 +24,7 @@ use tracing::{info, warn};
 use crate::{
     chatgpt::{ChatGpt, Opened},
     error::ApiError,
+    ollama,
     upstream::Ollama,
     validate::ChatRequest,
     wol::Wol,
@@ -42,13 +47,16 @@ pub(crate) struct Providers<'a> {
 }
 
 pub(crate) async fn route(p: Providers<'_>, req: &ChatRequest) -> Result<Routed, ApiError> {
+    // A request the local model cannot take as written (a 400) is refused
+    // before anything is woken, and never falls back.
+    let body = ollama::request_body(req, p.ollama_model, p.ollama.num_ctx())?;
     let local = async {
         // Only authenticated, valid inference requests reach this point, so
         // nothing else can wake the Ollama host. Covers streaming and not.
         if let Some(wol) = p.wol {
             wol.ensure_ready().await?;
         }
-        p.ollama.chat(&req.upstream_body(p.ollama_model)).await
+        p.ollama.chat(&body).await
     };
     let local = match local.await {
         Ok(res) => return Ok(Routed::Local(res)),

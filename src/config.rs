@@ -15,6 +15,7 @@ use tracing::warn;
 const MIN_API_KEY_LEN: usize = 32;
 const MAX_CONCURRENCY: usize = 64;
 const MAX_WOL_STARTUP_SECONDS: u64 = 3600;
+const NUM_CTX_RANGE: std::ops::RangeInclusive<u32> = 512..=1_048_576;
 
 pub struct Config {
     pub host: IpAddr,
@@ -23,6 +24,9 @@ pub struct Config {
     /// Always ends in `/` so endpoint paths can be joined onto it.
     pub ollama_base_url: Url,
     pub ollama_model: String,
+    /// `options.num_ctx` sent with every request; `None` leaves the context
+    /// size to Ollama (`OLLAMA_CONTEXT_LENGTH`, Modelfile or its default).
+    pub ollama_num_ctx: Option<u32>,
     pub virtual_model: String,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -53,6 +57,8 @@ pub struct ChatGptConfig {
     pub limit_pause: Duration,
     /// Drop sampling hints the ChatGPT plan route rejects instead of failing.
     pub drop_unsupported_sampling: bool,
+    /// Drop `max_tokens` (which the route cannot honour) instead of failing.
+    pub drop_max_tokens: bool,
     /// OAuth issuer (OIDC discovery base). Fixed in production; tests point
     /// it at a mock. Not settable from the environment.
     pub issuer: Url,
@@ -102,6 +108,7 @@ impl fmt::Debug for ChatGptConfig {
             .field("stream_idle_timeout", &self.stream_idle_timeout)
             .field("limit_pause", &self.limit_pause)
             .field("drop_unsupported_sampling", &self.drop_unsupported_sampling)
+            .field("drop_max_tokens", &self.drop_max_tokens)
             .field("issuer", &self.issuer.as_str())
             .field("api_base", &self.api_base.as_str())
             .finish()
@@ -238,6 +245,22 @@ impl Config {
             ));
         }
 
+        let ollama_num_ctx = env
+            .get("OLLAMA_NUM_CTX")
+            .map(|v| {
+                v.parse()
+                    .ok()
+                    .filter(|n| NUM_CTX_RANGE.contains(n))
+                    .ok_or_else(|| {
+                        format!(
+                            "OLLAMA_NUM_CTX must be a whole number between {} and {}",
+                            NUM_CTX_RANGE.start(),
+                            NUM_CTX_RANGE.end()
+                        )
+                    })
+            })
+            .transpose()?;
+
         let log_prompt_content = env.bool("LOG_PROMPT_CONTENT")?;
         let wol = wol_config(&env)?;
         no_api_billing(&env)?;
@@ -253,6 +276,7 @@ impl Config {
             api_key,
             ollama_base_url,
             ollama_model: env.required("OLLAMA_MODEL")?,
+            ollama_num_ctx,
             virtual_model: env
                 .get("OPENGATE_VIRTUAL_MODEL")
                 .unwrap_or_else(|| "opengate/local".into()),
@@ -279,6 +303,7 @@ impl fmt::Debug for Config {
             .field("api_key", &"<redacted>")
             .field("ollama_base_url", &self.ollama_base_url.as_str())
             .field("ollama_model", &self.ollama_model)
+            .field("ollama_num_ctx", &self.ollama_num_ctx)
             .field("virtual_model", &self.virtual_model)
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
@@ -411,6 +436,7 @@ fn chatgpt_config<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<ChatGpt
         stream_idle_timeout: env.seconds("CHATGPT_STREAM_IDLE_TIMEOUT_SECONDS", 120)?,
         limit_pause: env.seconds("CHATGPT_LIMIT_PAUSE_SECONDS", 300)?,
         drop_unsupported_sampling: env.bool("CHATGPT_DROP_UNSUPPORTED_SAMPLING")?,
+        drop_max_tokens: env.bool("CHATGPT_DROP_MAX_TOKENS")?,
         issuer: CHATGPT_ISSUER.parse().expect("valid constant"),
         api_base: CHATGPT_API_BASE.parse().expect("valid constant"),
     })
@@ -542,6 +568,19 @@ mod tests {
         assert_eq!(c.ollama_base_url.as_str(), "http://192.168.1.50:11434/");
         assert_eq!(c.max_concurrent_requests, 2);
         assert!(!c.log_prompt_content);
+        assert_eq!(c.ollama_num_ctx, None);
+    }
+
+    #[test]
+    fn num_ctx() {
+        let mut vars = minimal();
+        vars.push(("OLLAMA_NUM_CTX", "32768"));
+        assert_eq!(load(&vars).unwrap().ollama_num_ctx, Some(32768));
+        for bad in ["0", "100", "lots", "-1", "99999999"] {
+            let mut vars = minimal();
+            vars.push(("OLLAMA_NUM_CTX", bad));
+            assert!(load(&vars).unwrap_err().contains("OLLAMA_NUM_CTX"), "{bad}");
+        }
     }
 
     #[test]
@@ -734,6 +773,7 @@ mod tests {
         assert_eq!(c.issuer.as_str(), "https://auth.openai.com/");
         assert_eq!(c.api_base.as_str(), "https://api.openai.com/v1/");
         assert!(!c.drop_unsupported_sampling);
+        assert!(!c.drop_max_tokens);
         let c = chatgpt(&[("CHATGPT_MODEL", "gpt-6.1-sol")])
             .unwrap()
             .chatgpt
@@ -778,6 +818,7 @@ mod tests {
             ("CHATGPT_CREDENTIALS_PATH", "relative/creds.json"),
             ("CHATGPT_LIMIT_PAUSE_SECONDS", "0"),
             ("CHATGPT_DROP_UNSUPPORTED_SAMPLING", "maybe"),
+            ("CHATGPT_DROP_MAX_TOKENS", "maybe"),
         ] {
             let err = chatgpt(&[(k, v)])
                 .err()

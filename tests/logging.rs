@@ -41,11 +41,11 @@ async fn logs_never_contain_prompts_responses_or_keys() {
 
     let reply = "purple-elephant-model-reply";
     let mock = Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(move || async move {
             Json(json!({
-                "id": "c", "object": "chat.completion", "created": 1, "model": "llama3.1:8b",
-                "choices": [{ "index": 0, "message": { "role": "assistant", "content": reply }, "finish_reason": "stop" }],
+                "model": "llama3.1:8b", "message": { "role": "assistant", "content": reply },
+                "done": true, "done_reason": "stop",
             }))
         }),
     );

@@ -230,8 +230,11 @@ impl ChatGpt {
                 return Err(CloudError::LimitReached);
             }
         }
-        let (mut body, include_usage) =
-            responses::translate(req, self.0.config.drop_unsupported_sampling)?;
+        let (mut body, include_usage) = responses::translate(
+            req,
+            self.0.config.drop_unsupported_sampling,
+            self.0.config.drop_max_tokens,
+        )?;
         body["model"] = self.model().await?.into();
         let url = self
             .0

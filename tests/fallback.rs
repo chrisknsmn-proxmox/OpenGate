@@ -272,11 +272,11 @@ async fn local_rejections_and_mid_stream_failures_never_fall_back() {
 
     // Ollama is up but refuses this request (4xx): not an availability problem.
     let rejecting = serve(Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(|| async {
             (
                 axum::http::StatusCode::BAD_REQUEST,
-                Json(json!({ "error": { "message": "context too long" } })),
+                Json(json!({ "error": "invalid options" })),
             )
         }),
     ))
@@ -290,11 +290,10 @@ async fn local_rejections_and_mid_stream_failures_never_fall_back() {
 
     // Ollama accepted (HTTP 200) and then broke mid-stream: already committed.
     let broken = serve(Router::new().route(
-        "/v1/chat/completions",
+        "/api/chat",
         post(|| async {
-            let chunk = json!({ "id": "c", "object": "chat.completion.chunk", "created": 1, "model": "x",
-                "choices": [{ "index": 0, "delta": { "content": "Hel" }, "finish_reason": null }] });
-            ([("content-type", "text/event-stream")], format!("data: {chunk}\n\n"))
+            let chunk = json!({ "model": "x", "message": { "role": "assistant", "content": "Hel" }, "done": false });
+            ([("content-type", "application/x-ndjson")], format!("{chunk}\n"))
         }),
     ))
     .await;

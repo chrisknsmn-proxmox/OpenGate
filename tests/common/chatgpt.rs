@@ -51,6 +51,8 @@ pub enum Inference {
     Unavailable,
     /// Streams forever until the client hangs up.
     Endless,
+    /// Streams two function calls (arguments in fragments) and completes.
+    ToolCalls,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -340,6 +342,42 @@ pub fn ok_events() -> Vec<String> {
     ]
 }
 
+/// Two function calls: the first streams its arguments in fragments, the
+/// second arrives whole in `output_item.done`.
+pub fn tool_call_events() -> Vec<String> {
+    let fc = |id: &str, call: &str, name: &str, args: &str| {
+        json!({ "type": "function_call", "id": id, "call_id": call, "name": name,
+            "namespace": "opengate", "arguments": args })
+    };
+    vec![
+        event(
+            json!({ "type": "response.created", "response": { "id": "resp_tools", "created_at": 1_700_000_000 } }),
+        ),
+        event(
+            json!({ "type": "response.output_item.added", "output_index": 0, "item": fc("fc_1", "call_cg1", "get_weather", "") }),
+        ),
+        event(
+            json!({ "type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 0, "delta": "{\"city\":" }),
+        ),
+        event(
+            json!({ "type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 0, "delta": "\"Paris\"}" }),
+        ),
+        event(
+            json!({ "type": "response.function_call_arguments.done", "item_id": "fc_1", "output_index": 0, "arguments": "{\"city\":\"Paris\"}" }),
+        ),
+        event(
+            json!({ "type": "response.output_item.done", "output_index": 0, "item": fc("fc_1", "call_cg1", "get_weather", "{\"city\":\"Paris\"}") }),
+        ),
+        event(
+            json!({ "type": "response.output_item.done", "output_index": 1, "item": fc("fc_2", "call_cg2", "get_time", "{}") }),
+        ),
+        event(
+            json!({ "type": "response.completed", "response": { "id": "resp_tools",
+            "usage": { "input_tokens": 20, "output_tokens": 9, "total_tokens": 29 } } }),
+        ),
+    ]
+}
+
 fn sse(parts: Vec<String>) -> Response {
     let body = stream::iter(
         parts
@@ -373,6 +411,7 @@ async fn responses(
     let mode = *m.0.inference.lock().unwrap();
     match mode {
         Inference::Ok | Inference::RejectInitialToken | Inference::Unauthorized => sse(ok_events()),
+        Inference::ToolCalls => sse(tool_call_events()),
         Inference::LimitHttp => (
             StatusCode::TOO_MANY_REQUESTS,
             [("x-request-id", "req_limit_1")],

@@ -8,6 +8,9 @@ services:
       OPENGATE_API_KEY: ${OPENGATE_API_KEY:?OPENGATE_API_KEY is required}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:?OLLAMA_BASE_URL is required}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      # Context window requested from Ollama per request (README: "Context
+      # window"). Empty = Ollama's own setting. Must fit the PC's memory.
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-}
       OPENGATE_VIRTUAL_MODEL: ${OPENGATE_VIRTUAL_MODEL:-opengate/local}
       OPENGATE_HOST: 0.0.0.0
       OPENGATE_PORT: "8000"
@@ -41,6 +44,7 @@ services:
       CHATGPT_STREAM_IDLE_TIMEOUT_SECONDS: ${CHATGPT_STREAM_IDLE_TIMEOUT_SECONDS:-120}
       CHATGPT_LIMIT_PAUSE_SECONDS: ${CHATGPT_LIMIT_PAUSE_SECONDS:-300}
       CHATGPT_DROP_UNSUPPORTED_SAMPLING: ${CHATGPT_DROP_UNSUPPORTED_SAMPLING:-false}
+      CHATGPT_DROP_MAX_TOKENS: ${CHATGPT_DROP_MAX_TOKENS:-false}
       # Must stay false: OpenGate refuses to start otherwise. It never uses
       # an OpenAI API key or API billing.
       OPENAI_API_BILLING_ENABLED: "false"
