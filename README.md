@@ -22,14 +22,7 @@ cd OpenGate
 cp .env.example .env
 ```
 
-Edit `.env` and set:
-
-| Setting | Value |
-| --- | --- |
-| `OPENGATE_API_KEY` | A strong, randomly generated client secret |
-| `OLLAMA_BASE_URL` | Your Ollama server URL, reachable from Docker |
-| `OLLAMA_MODEL` | An installed model; default: `llama3.1:8b` |
-| `OPENGATE_PUBLISH_ADDRESS` | `127.0.0.1` for local use |
+Run the Docker container and check it's health.
 
 ```bash
 docker compose up --build -d
@@ -58,11 +51,3 @@ A private server-side timer checks `main` every minute and queues both through C
 
 Server-side operating notes: `/opt/opengate-autodeploy/README.md`. The detailed reference’s older automatic-deployment instructions describe an alternative setup, not this installed timer.
 
-## Development
-
-```bash
-git config core.hooksPath .githooks  # enable the repository’s secret guard
-cargo test                        # requires the Rust toolchain
-```
-
-[Full reference](REFERENCE.md): API fields, configuration, security, troubleshooting, Docker-based tests, and manual deployment.
