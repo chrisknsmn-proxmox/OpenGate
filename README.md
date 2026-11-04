@@ -31,8 +31,6 @@ Edit `.env` and set:
 | `OLLAMA_MODEL` | An installed model; default: `llama3.1:8b` |
 | `OPENGATE_PUBLISH_ADDRESS` | `127.0.0.1` for local use |
 
-Keep `.env` private. Then start the gateway:
-
 ```bash
 docker compose up --build -d
 curl http://127.0.0.1:8100/health/ready
